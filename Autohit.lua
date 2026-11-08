@@ -1,6 +1,5 @@
--- Auto Hit — Farm / Fight / Speed
--- Loader:  loadstring(game:HttpGet("<RAW_URL>?v="..tick()))()
-local VERSION = "2.5"
+-- Auto Hit — Farm / Fight / Speed / Jump
+local VERSION = "2.6"
 
 --------------------------------------------------------------------
 -- Teardown any previous copy (connections, loops, GUI)
@@ -54,13 +53,19 @@ end
 local farmOn    = false
 local fightOn   = false
 local speedOn   = false
+local jumpOn    = false
 local speedVal  = 32
+local jumpVal   = 50
 local origSpeed = 16
+local origJump  = 50
 local teleporting = false -- pause loops during zone transitions
 
 local SCAN_RANGE   = 12
 local LOOP_DELAY   = 0.55
-local FARM_LOOPS   = 3 -- reduced from 6 to prevent crash
+local FARM_LOOPS   = 3
+
+local MIN_SPEED, MAX_SPEED = 16, 100
+local MIN_JUMP,  MAX_JUMP  = 50, 300
 
 local PICK_TARGETS = {Stone=1, Coal=1, IronOre=1, Clay=1, Sand=1, GoldOre=1}
 local AXE_TARGETS  = {Tree=1, Pine=1}
@@ -83,21 +88,32 @@ task.spawn(function()
 	end
 end)
 
+local function getHRP()
+	local c = plr.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHumanoid()
+	local c = plr.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+
 task.spawn(function()
 	while _G._autoHitAlive do
 		task.wait(5)
-		local c = plr.Character
-		local h = c and c:FindFirstChildOfClass("Humanoid")
-		dlog(string.format("stat swings/5s=%d farm=%s fight=%s speed=%s ws=%s",
-			swings, tostring(farmOn), tostring(fightOn), tostring(speedOn),
-			tostring(h and h.WalkSpeed or "nil")))
+		local h = getHumanoid()
+		dlog(string.format("stat swings/5s=%d farm=%s fight=%s speed=%s jump=%s ws=%s jp=%s",
+			swings, tostring(farmOn), tostring(fightOn), tostring(speedOn), tostring(jumpOn),
+			tostring(h and h.WalkSpeed or "nil"), tostring(h and h.JumpPower or "nil")))
 		swings = 0
 	end
 end)
 
--- Speed enforcement by POLLING, not by listening.
--- Reacting to WalkSpeed changes fought the game's own sprint script: each
+--------------------------------------------------------------------
+-- Speed / Jump enforcement by POLLING, not by listening.
+-- Reacting to property changes fought the game's own sprint script: each
 -- listener re-triggered the other, which storms the client. Polling cannot.
+--------------------------------------------------------------------
 local speedLoopRunning = false
 local function startSpeedEnforcer()
 	if speedLoopRunning then return end
@@ -105,8 +121,7 @@ local function startSpeedEnforcer()
 	task.spawn(function()
 		dlog("speed enforcer start")
 		while _G._autoHitAlive and speedOn do
-			local c = plr.Character
-			local hum = c and c:FindFirstChildOfClass("Humanoid")
+			local hum = getHumanoid()
 			if hum and hum.WalkSpeed ~= speedVal then
 				hum.WalkSpeed = speedVal
 			end
@@ -114,6 +129,34 @@ local function startSpeedEnforcer()
 		end
 		speedLoopRunning = false
 		dlog("speed enforcer stop")
+	end)
+end
+
+-- Newer rigs default to JumpHeight; force the JumpPower model so one
+-- number controls it, and pcall in case the property is locked.
+local function setJump(hum, v)
+	if not hum then return end
+	pcall(function()
+		hum.UseJumpPower = true
+		hum.JumpPower = v
+	end)
+end
+
+local jumpLoopRunning = false
+local function startJumpEnforcer()
+	if jumpLoopRunning then return end
+	jumpLoopRunning = true
+	task.spawn(function()
+		dlog("jump enforcer start")
+		while _G._autoHitAlive and jumpOn do
+			local hum = getHumanoid()
+			if hum and hum.JumpPower ~= jumpVal then
+				setJump(hum, jumpVal)
+			end
+			task.wait(0.15)
+		end
+		jumpLoopRunning = false
+		dlog("jump enforcer stop")
 	end)
 end
 
@@ -134,17 +177,11 @@ track(plr.CharacterAdded:Connect(function(char)
 		hum.WalkSpeed = speedVal
 		startSpeedEnforcer()
 	end
+	if hum and jumpOn then
+		setJump(hum, jumpVal)
+		startJumpEnforcer()
+	end
 end))
-
-local function getHRP()
-	local c = plr.Character
-	return c and c:FindFirstChild("HumanoidRootPart")
-end
-
-local function getHumanoid()
-	local c = plr.Character
-	return c and c:FindFirstChildOfClass("Humanoid")
-end
 
 local ZONE_NAMES = {"Hub", "Ruins"}
 
@@ -206,7 +243,9 @@ local function isAlive(hb)
 	return (hb.Position - hrp.Position).Magnitude <= SCAN_RANGE
 end
 
+--------------------------------------------------------------------
 -- GUI
+--------------------------------------------------------------------
 local gui = Instance.new("ScreenGui")
 gui.Name = "AutoHitGui"
 gui.ResetOnSpawn = false
@@ -214,8 +253,8 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent = plr.PlayerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 220, 0, 140)
-frame.Position = UDim2.new(0, 20, 0.5, -70)
+frame.Size = UDim2.new(0, 220, 0, 190)
+frame.Position = UDim2.new(0, 20, 0.5, -95)
 frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
 frame.BackgroundTransparency = 0.15
 frame.BorderSizePixel = 0
@@ -250,74 +289,90 @@ local function makeToggleRow(parent, yOff, label, key)
 	return dot, lbl
 end
 
-local farmDot, farmLbl   = makeToggleRow(frame, 10, "Auto Farm", "H")
-local fightDot, fightLbl = makeToggleRow(frame, 40, "Auto Fight", "J")
-local speedDot, speedLbl = makeToggleRow(frame, 70, "Speed", "U")
+-- One factory for every slider, so adding another is three lines.
+local function makeSlider(parent, yOff, minV, maxV, initV, color, onChange)
+	local bg = Instance.new("Frame")
+	bg.Size = UDim2.new(1, -66, 0, 8)
+	bg.Position = UDim2.new(0, 28, 0, yOff)
+	bg.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+	bg.BorderSizePixel = 0
+	bg.Parent = parent
+	local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(1, 0); bc.Parent = bg
 
-local sliderBg = Instance.new("Frame")
-sliderBg.Size = UDim2.new(1, -50, 0, 8)
-sliderBg.Position = UDim2.new(0, 28, 0, 105)
-sliderBg.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
-sliderBg.BorderSizePixel = 0
-sliderBg.Parent = frame
-local sc = Instance.new("UICorner"); sc.CornerRadius = UDim.new(1, 0); sc.Parent = sliderBg
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.new(0, 0, 1, 0)
+	fill.BackgroundColor3 = color
+	fill.BorderSizePixel = 0
+	fill.Parent = bg
+	local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(1, 0); fc.Parent = fill
 
-local sliderFill = Instance.new("Frame")
-sliderFill.Size = UDim2.new(0.2, 0, 1, 0)
-sliderFill.BackgroundColor3 = Color3.fromRGB(0, 170, 255)
-sliderFill.BorderSizePixel = 0
-sliderFill.Parent = sliderBg
-local sf = Instance.new("UICorner"); sf.CornerRadius = UDim.new(1, 0); sf.Parent = sliderFill
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(0, 40, 0, 16)
+	lbl.Position = UDim2.new(1, -46, 0, yOff - 4)
+	lbl.BackgroundTransparency = 1
+	lbl.TextColor3 = color
+	lbl.TextSize = 13
+	lbl.Font = Enum.Font.GothamBold
+	lbl.TextXAlignment = Enum.TextXAlignment.Right
+	lbl.Parent = parent
 
-local sliderValLbl = Instance.new("TextLabel")
-sliderValLbl.Size = UDim2.new(0, 36, 0, 16)
-sliderValLbl.Position = UDim2.new(1, -36, 0, 101)
-sliderValLbl.BackgroundTransparency = 1
-sliderValLbl.Text = tostring(speedVal)
-sliderValLbl.TextColor3 = Color3.fromRGB(0, 170, 255)
-sliderValLbl.TextSize = 13
-sliderValLbl.Font = Enum.Font.GothamBold
-sliderValLbl.TextXAlignment = Enum.TextXAlignment.Right
-sliderValLbl.Parent = frame
+	local dragging = false
 
-local MIN_SPEED, MAX_SPEED = 16, 100
-local draggingSlider = false
+	local function apply(pct)
+		pct = math.clamp(pct, 0, 1)
+		local v = math.floor(minV + (maxV - minV) * pct + 0.5)
+		fill.Size = UDim2.new(pct, 0, 1, 0)
+		lbl.Text = tostring(v)
+		onChange(v)
+	end
 
-local function updateSlider(pct)
-	pct = math.clamp(pct, 0, 1)
-	speedVal = math.floor(MIN_SPEED + (MAX_SPEED - MIN_SPEED) * pct + 0.5)
-	sliderFill.Size = UDim2.new(pct, 0, 1, 0)
-	sliderValLbl.Text = tostring(speedVal)
+	apply((initV - minV) / (maxV - minV))
+
+	track(bg.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			apply((input.Position.X - bg.AbsolutePosition.X) / bg.AbsoluteSize.X)
+		end
+	end))
+	track(UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			apply((input.Position.X - bg.AbsolutePosition.X) / bg.AbsoluteSize.X)
+		end
+	end))
+	track(UIS.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+end
+
+local farmDot,  farmLbl  = makeToggleRow(frame, 10,  "Auto Farm",  "H")
+local fightDot, fightLbl = makeToggleRow(frame, 40,  "Auto Fight", "J")
+local speedDot, speedLbl = makeToggleRow(frame, 70,  "Speed",      "U")
+
+makeSlider(frame, 104, MIN_SPEED, MAX_SPEED, speedVal, Color3.fromRGB(0, 170, 255), function(v)
+	speedVal = v
 	if speedOn then
 		local hum = getHumanoid()
 		if hum then hum.WalkSpeed = speedVal end
 	end
-end
-updateSlider((speedVal - MIN_SPEED) / (MAX_SPEED - MIN_SPEED))
+end)
 
-track(sliderBg.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		draggingSlider = true
-		updateSlider((input.Position.X - sliderBg.AbsolutePosition.X) / sliderBg.AbsoluteSize.X)
-	end
-end))
-track(UIS.InputChanged:Connect(function(input)
-	if draggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-		updateSlider((input.Position.X - sliderBg.AbsolutePosition.X) / sliderBg.AbsoluteSize.X)
-	end
-end))
-track(UIS.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		draggingSlider = false
-	end
-end))
+local jumpDot, jumpLbl = makeToggleRow(frame, 126, "Jump", "K")
+
+makeSlider(frame, 160, MIN_JUMP, MAX_JUMP, jumpVal, Color3.fromRGB(190, 120, 255), function(v)
+	jumpVal = v
+	if jumpOn then setJump(getHumanoid(), jumpVal) end
+end)
 
 local function refreshDot(dot, lbl, on, color)
 	dot.BackgroundColor3 = on and color or Color3.fromRGB(60, 60, 60)
 	lbl.TextColor3 = on and color or Color3.fromRGB(180, 180, 180)
 end
 
--- Farm — pauses during teleport
+--------------------------------------------------------------------
+-- Loops
+--------------------------------------------------------------------
 local function farmLoop()
 	while _G._autoHitAlive and farmOn do
 		task.wait() -- unconditional yield: no branch below can spin the thread
@@ -351,7 +406,6 @@ local function startFarm()
 	end
 end
 
--- Fight — pauses during teleport
 local function fightLoop()
 	while _G._autoHitAlive and fightOn do
 		task.wait() -- unconditional yield: no branch below can spin the thread
@@ -370,7 +424,9 @@ local function fightLoop()
 	end
 end
 
--- Speed
+--------------------------------------------------------------------
+-- Apply
+--------------------------------------------------------------------
 local function applySpeed(on)
 	local hum = getHumanoid()
 	if not hum then return end
@@ -381,7 +437,19 @@ local function applySpeed(on)
 	end
 end
 
+local function applyJump(on)
+	local hum = getHumanoid()
+	if not hum then return end
+	if on then
+		setJump(hum, jumpVal); startJumpEnforcer()
+	else
+		setJump(hum, origJump)
+	end
+end
+
+--------------------------------------------------------------------
 -- Keybinds
+--------------------------------------------------------------------
 _G._autoHitKey = track(UIS.InputBegan:Connect(function(input, gpe)
 	if gpe or not _G._autoHitAlive then return end
 	if input.KeyCode == Enum.KeyCode.H then
@@ -393,8 +461,11 @@ _G._autoHitKey = track(UIS.InputBegan:Connect(function(input, gpe)
 	elseif input.KeyCode == Enum.KeyCode.U then
 		speedOn = not speedOn; refreshDot(speedDot, speedLbl, speedOn, Color3.fromRGB(0,170,255))
 		dlog("speed -> "..tostring(speedOn).." @"..tostring(speedVal)); applySpeed(speedOn)
+	elseif input.KeyCode == Enum.KeyCode.K then
+		jumpOn = not jumpOn; refreshDot(jumpDot, jumpLbl, jumpOn, Color3.fromRGB(190,120,255))
+		dlog("jump -> "..tostring(jumpOn).." @"..tostring(jumpVal)); applyJump(jumpOn)
 	end
 end))
 
 dlog("loaded")
-print(("[AutoHit v%s] Loaded — H=Farm  J=Fight  U=Speed"):format(VERSION))
+print(("[AutoHit v%s] Loaded — H=Farm  J=Fight  U=Speed  K=Jump"):format(VERSION))
