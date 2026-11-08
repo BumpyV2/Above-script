@@ -1,5 +1,5 @@
--- Auto Hit — Farm / Fight / Speed / Jump
-local VERSION = "2.6"
+-- Auto Hit — Farm / Fight / Speed / Jump / Bow
+local VERSION = "2.7"
 
 --------------------------------------------------------------------
 -- Teardown any previous copy (connections, loops, GUI)
@@ -18,6 +18,7 @@ task.wait(0.7)
 
 local Players      = game:GetService("Players")
 local UIS          = game:GetService("UserInputService")
+local CS           = game:GetService("CollectionService")
 local plr          = Players.LocalPlayer
 
 pcall(function()
@@ -36,10 +37,22 @@ if not Remotes then
 end
 local RequestEquip = Remotes:WaitForChild("RequestEquipSlot", 10)
 local RequestSwing = Remotes:WaitForChild("RequestSwing", 10)
+local RequestShoot  = Remotes:FindFirstChild("RequestShoot")
+local RequestSprint = Remotes:FindFirstChild("RequestSprint")
 if not (RequestEquip and RequestSwing) then
 	warn("[AutoHit] Required remotes missing — aborting")
 	return
 end
+
+-- The game's own ballistics solver + weapon table. Using them means the arc
+-- we send the server is the exact arc the server expects for that draw.
+local Shared       = game:GetService("ReplicatedStorage"):FindFirstChild("Shared")
+local Ballistics   = Shared and Shared:FindFirstChild("Ballistics")
+local WeaponCfgMod = Shared and Shared:FindFirstChild("Config") and Shared.Config:FindFirstChild("WeaponConfig")
+local okB, BAL = pcall(function() return require(Ballistics) end)
+local okW, WCFG = pcall(function() return require(WeaponCfgMod) end)
+if not okB then BAL = nil end
+if not okW then WCFG = nil end
 
 _G._autoHitAlive = true
 _G._autoHitConns = {}
@@ -54,8 +67,12 @@ local farmOn    = false
 local fightOn   = false
 local speedOn   = false
 local jumpOn    = false
+local bowOn     = false
+local magicOn   = true
 local speedVal  = 32
 local jumpVal   = 50
+local bowDelay  = 0.25 -- seconds between shots
+local drawFrac  = 1.00 -- 0.12 .. 1.00
 local origSpeed = 16
 local origJump  = 50
 local teleporting = false -- pause loops during zone transitions
@@ -66,13 +83,15 @@ local FARM_LOOPS   = 3
 
 local MIN_SPEED, MAX_SPEED = 16, 100
 local MIN_JUMP,  MAX_JUMP  = 50, 300
+local MIN_RATE,  MAX_RATE  = 50, 1000 -- ms between shots
+local MIN_DRAW,  MAX_DRAW  = 12, 100  -- percent of a full draw
 
 local PICK_TARGETS = {Stone=1, Coal=1, IronOre=1, Clay=1, Sand=1, GoldOre=1}
 local AXE_TARGETS  = {Tree=1, Pine=1}
 
 -- Debug trail — survives a crash if the executor has writefile.
 local LOG_ENABLED = true
-local logBuf, swings = {}, 0
+local logBuf, swings, shots = {}, 0, 0
 local function dlog(msg)
 	if not LOG_ENABLED then return end
 	logBuf[#logBuf + 1] = string.format("[%7.1f] %s", os.clock(), msg)
@@ -102,10 +121,11 @@ task.spawn(function()
 	while _G._autoHitAlive do
 		task.wait(5)
 		local h = getHumanoid()
-		dlog(string.format("stat swings/5s=%d farm=%s fight=%s speed=%s jump=%s ws=%s jp=%s",
-			swings, tostring(farmOn), tostring(fightOn), tostring(speedOn), tostring(jumpOn),
+		dlog(string.format("stat swings/5s=%d shots/5s=%d farm=%s fight=%s speed=%s jump=%s bow=%s magic=%s ws=%s jp=%s",
+			swings, shots, tostring(farmOn), tostring(fightOn), tostring(speedOn), tostring(jumpOn),
+			tostring(bowOn), tostring(magicOn),
 			tostring(h and h.WalkSpeed or "nil"), tostring(h and h.JumpPower or "nil")))
-		swings = 0
+		swings, shots = 0, 0
 	end
 end)
 
@@ -244,6 +264,77 @@ local function isAlive(hb)
 end
 
 --------------------------------------------------------------------
+-- Ranged targeting
+--------------------------------------------------------------------
+-- What the bow is actually holding right now. HeldTool carries an ItemId
+-- attribute; WeaponConfig maps that to the projectile the server expects.
+local projCache = {}
+local function heldProjectile()
+	if not WCFG then return nil, nil end
+	local char = plr.Character
+	local ht = char and char:FindFirstChild("HeldTool")
+	local id = ht and ht:GetAttribute("ItemId")
+	if not id then return nil, nil end
+	local w = WCFG.Weapons and WCFG.Weapons[id]
+	if not (w and w.ranged) then return nil, id end
+	local cached = projCache[id]
+	if cached == nil then
+		local ok, cfg = pcall(WCFG.projectileOf, id)
+		cached = (ok and type(cfg) == "table") and cfg or false
+		projCache[id] = cached
+	end
+	if not cached then return nil, id end
+	return cached, id
+end
+
+local function nearestEnemyPoint(origin, range)
+	local best, bestD = nil, range
+	local seen = {}
+	local function consider(model)
+		if not model or seen[model] then return end
+		seen[model] = true
+		local hb = model:FindFirstChild("HB")
+		local part = (hb and hb:IsA("BasePart") and hb)
+			or model:FindFirstChild("HumanoidRootPart")
+			or (model:IsA("Model") and model.PrimaryPart)
+		if not (part and part:IsA("BasePart")) then return end
+		local hum = model:FindFirstChildOfClass("Humanoid")
+		if hum and hum.Health <= 0 then return end
+		local d = (part.Position - origin).Magnitude
+		if d < bestD then best, bestD = part.Position, d end
+	end
+	for _, m in CS:GetTagged("Enemy") do consider(m) end
+	for _, folder in getMobFolders() do
+		for _, m in folder:GetChildren() do consider(m) end
+	end
+	return best
+end
+
+-- Solve the launch direction that actually lands on the target, using the
+-- game's own solver so the arc matches what the server simulates.
+local function solveDirection(origin, target, proj)
+	local rel = target - origin
+	if BAL and BAL.aimDirection and WCFG and WCFG.launchSpeed then
+		local okS, speed = pcall(WCFG.launchSpeed, proj, drawFrac)
+		if okS and type(speed) == "number" and speed > 0 then
+			local okD, dir = pcall(BAL.aimDirection, rel, speed, proj.gravity or 0)
+			if okD and typeof(dir) == "Vector3" and dir.Magnitude > 0 then
+				return dir.Unit
+			end
+		end
+	end
+	-- Fallback: straight line with a little loft so gravity does not eat it.
+	if rel.Magnitude < 0.001 then return nil end
+	if (proj.gravity or 0) > 0 then
+		local flat = Vector3.new(rel.X, 0, rel.Z)
+		if flat.Magnitude > 0.001 then
+			return (flat.Unit + Vector3.new(0, 0.15, 0)).Unit
+		end
+	end
+	return rel.Unit
+end
+
+--------------------------------------------------------------------
 -- GUI
 --------------------------------------------------------------------
 local gui = Instance.new("ScreenGui")
@@ -253,8 +344,8 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent = plr.PlayerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 220, 0, 190)
-frame.Position = UDim2.new(0, 20, 0.5, -95)
+frame.Size = UDim2.new(0, 220, 0, 300)
+frame.Position = UDim2.new(0, 20, 0.5, -150)
 frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
 frame.BackgroundTransparency = 0.15
 frame.BorderSizePixel = 0
@@ -365,6 +456,18 @@ makeSlider(frame, 160, MIN_JUMP, MAX_JUMP, jumpVal, Color3.fromRGB(190, 120, 255
 	if jumpOn then setJump(getHumanoid(), jumpVal) end
 end)
 
+local bowDot,   bowLbl   = makeToggleRow(frame, 182, "Auto Bow",  "B")
+
+makeSlider(frame, 216, MIN_RATE, MAX_RATE, math.floor(bowDelay * 1000 + 0.5), Color3.fromRGB(255, 210, 90), function(v)
+	bowDelay = v / 1000
+end)
+
+makeSlider(frame, 238, MIN_DRAW, MAX_DRAW, math.floor(drawFrac * 100 + 0.5), Color3.fromRGB(255, 150, 90), function(v)
+	drawFrac = v / 100
+end)
+
+local magicDot, magicLbl = makeToggleRow(frame, 258, "Magic Aim", "N")
+
 local function refreshDot(dot, lbl, on, color)
 	dot.BackgroundColor3 = on and color or Color3.fromRGB(60, 60, 60)
 	lbl.TextColor3 = on and color or Color3.fromRGB(180, 180, 180)
@@ -424,6 +527,41 @@ local function fightLoop()
 	end
 end
 
+-- Bow — fires RequestShoot directly, so the arrow goes where we aim it
+-- rather than where the camera points.
+local shotId = 0
+local function bowLoop()
+	while _G._autoHitAlive and bowOn do
+		task.wait() -- unconditional yield: no branch below can spin the thread
+		if teleporting or not RequestShoot then
+			task.wait(0.5)
+			continue
+		end
+		local hrp = getHRP()
+		local proj = heldProjectile()
+		if not (hrp and proj) then
+			task.wait(0.3)
+			continue
+		end
+		local origin = hrp.Position
+		local dir
+		if magicOn then
+			local target = nearestEnemyPoint(origin, math.min(proj.rangeStuds or 300, 300))
+			if target then dir = solveDirection(origin, target, proj) end
+		end
+		if not dir then
+			local cam = workspace.CurrentCamera
+			dir = cam and cam.CFrame.LookVector
+		end
+		if dir then
+			shotId += 1
+			RequestShoot:FireServer(origin, dir.Unit, drawFrac, shotId)
+			shots += 1
+		end
+		task.wait(bowDelay)
+	end
+end
+
 --------------------------------------------------------------------
 -- Apply
 --------------------------------------------------------------------
@@ -435,6 +573,15 @@ local function applySpeed(on)
 	else
 		hum.WalkSpeed = origSpeed
 	end
+end
+
+-- The server starts the draw timer from the aim signal, so hold it open
+-- for as long as the bow is on.
+local function applyBow(on)
+	if RequestSprint then
+		pcall(function() RequestSprint:FireServer(on, "Aim") end)
+	end
+	if on then task.spawn(bowLoop) end
 end
 
 local function applyJump(on)
@@ -464,8 +611,17 @@ _G._autoHitKey = track(UIS.InputBegan:Connect(function(input, gpe)
 	elseif input.KeyCode == Enum.KeyCode.K then
 		jumpOn = not jumpOn; refreshDot(jumpDot, jumpLbl, jumpOn, Color3.fromRGB(190,120,255))
 		dlog("jump -> "..tostring(jumpOn).." @"..tostring(jumpVal)); applyJump(jumpOn)
+	elseif input.KeyCode == Enum.KeyCode.B then
+		bowOn = not bowOn; refreshDot(bowDot, bowLbl, bowOn, Color3.fromRGB(255,210,90))
+		dlog("bow -> "..tostring(bowOn).." delay="..tostring(bowDelay).." draw="..tostring(drawFrac))
+		applyBow(bowOn)
+	elseif input.KeyCode == Enum.KeyCode.N then
+		magicOn = not magicOn; refreshDot(magicDot, magicLbl, magicOn, Color3.fromRGB(255,120,200))
+		dlog("magic -> "..tostring(magicOn))
 	end
 end))
 
-dlog("loaded")
-print(("[AutoHit v%s] Loaded — H=Farm  J=Fight  U=Speed  K=Jump"):format(VERSION))
+refreshDot(magicDot, magicLbl, magicOn, Color3.fromRGB(255,120,200))
+
+dlog("loaded shoot="..tostring(RequestShoot ~= nil).." bal="..tostring(BAL ~= nil).." wcfg="..tostring(WCFG ~= nil))
+print(("[AutoHit v%s] Loaded — H=Farm  J=Fight  U=Speed  K=Jump  B=Bow  N=MagicAim"):format(VERSION))
