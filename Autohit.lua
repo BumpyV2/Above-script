@@ -1,6 +1,6 @@
 -- Auto Hit — Farm / Fight / Speed
 -- Loader:  loadstring(game:HttpGet("<RAW_URL>?v="..tick()))()
-local VERSION = "2.3"
+local VERSION = "2.4"
 
 --------------------------------------------------------------------
 -- Teardown any previous copy (connections, loops, GUI)
@@ -65,19 +65,62 @@ local FARM_LOOPS   = 3 -- reduced from 6 to prevent crash
 local PICK_TARGETS = {Stone=1, Coal=1, IronOre=1, Clay=1, Sand=1, GoldOre=1}
 local AXE_TARGETS  = {Tree=1, Pine=1}
 
--- Speed enforcement hook (defined early — used by CharacterAdded below)
-local speedConn = nil
-local function hookSpeed(hum)
-	if speedConn then pcall(function() speedConn:Disconnect() end); speedConn = nil end
-	if not hum then return end
-	speedConn = track(hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
-		if speedOn and hum.WalkSpeed ~= speedVal then hum.WalkSpeed = speedVal end
-	end))
+-- Debug trail — survives a crash if the executor has writefile.
+local LOG_ENABLED = true
+local logBuf, swings = {}, 0
+local function dlog(msg)
+	if not LOG_ENABLED then return end
+	logBuf[#logBuf + 1] = string.format("[%7.1f] %s", os.clock(), msg)
+	if #logBuf > 600 then table.remove(logBuf, 1) end
+end
+
+task.spawn(function()
+	while _G._autoHitAlive do
+		task.wait(2)
+		if LOG_ENABLED and #logBuf > 0 then
+			pcall(function() writefile("AutoHit_debug.txt", table.concat(logBuf, "\n")) end)
+		end
+	end
+end)
+
+task.spawn(function()
+	while _G._autoHitAlive do
+		task.wait(5)
+		local c = plr.Character
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		dlog(string.format("stat swings/5s=%d farm=%s fight=%s speed=%s ws=%s",
+			swings, tostring(farmOn), tostring(fightOn), tostring(speedOn),
+			tostring(h and h.WalkSpeed or "nil")))
+		swings = 0
+	end
+end)
+
+-- Speed enforcement by POLLING, not by listening.
+-- Reacting to WalkSpeed changes fought the game's own sprint script: each
+-- listener re-triggered the other, which storms the client. Polling cannot.
+local speedLoopRunning = false
+local function startSpeedEnforcer()
+	if speedLoopRunning then return end
+	speedLoopRunning = true
+	task.spawn(function()
+		dlog("speed enforcer start")
+		while _G._autoHitAlive and speedOn do
+			local c = plr.Character
+			local hum = c and c:FindFirstChildOfClass("Humanoid")
+			if hum and hum.WalkSpeed ~= speedVal then
+				hum.WalkSpeed = speedVal
+			end
+			task.wait(0.15)
+		end
+		speedLoopRunning = false
+		dlog("speed enforcer stop")
+	end)
 end
 
 -- Detect teleport/respawn — pause all loops
 track(plr.CharacterRemoving:Connect(function()
 	teleporting = true
+	dlog("character removing, paused")
 end))
 
 track(plr.CharacterAdded:Connect(function(char)
@@ -85,10 +128,11 @@ track(plr.CharacterAdded:Connect(function(char)
 	task.wait(1) -- let zone load
 	teleporting = false
 
+	dlog("character added, resumed")
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	if hum and speedOn then
 		hum.WalkSpeed = speedVal
-		hookSpeed(hum)
+		startSpeedEnforcer()
 	end
 end))
 
@@ -286,7 +330,7 @@ local function farmLoop()
 				if PICK_TARGETS[name] then RequestEquip:FireServer("Pickaxe")
 				elseif AXE_TARGETS[name] then RequestEquip:FireServer("Axe") end
 				while _G._autoHitAlive and farmOn and not teleporting and isAlive(hb) do
-					RequestSwing:FireServer(hb); task.wait(LOOP_DELAY)
+					RequestSwing:FireServer(hb); swings += 1; task.wait(LOOP_DELAY)
 				end
 			else task.wait(0.2) end
 		else task.wait(1) end
@@ -311,7 +355,7 @@ local function fightLoop()
 		if hb then
 			RequestEquip:FireServer("Weapon")
 			while _G._autoHitAlive and fightOn and not teleporting and isAlive(hb) do
-				RequestSwing:FireServer(hb); task.wait(LOOP_DELAY)
+				RequestSwing:FireServer(hb); swings += 1; task.wait(LOOP_DELAY)
 			end
 		else task.wait(0.2) end
 	end
@@ -322,9 +366,8 @@ local function applySpeed(on)
 	local hum = getHumanoid()
 	if not hum then return end
 	if on then
-		origSpeed = 16; hum.WalkSpeed = speedVal; hookSpeed(hum)
+		origSpeed = 16; hum.WalkSpeed = speedVal; startSpeedEnforcer()
 	else
-		if speedConn then speedConn:Disconnect(); speedConn = nil end
 		hum.WalkSpeed = origSpeed
 	end
 end
@@ -334,14 +377,15 @@ _G._autoHitKey = track(UIS.InputBegan:Connect(function(input, gpe)
 	if gpe or not _G._autoHitAlive then return end
 	if input.KeyCode == Enum.KeyCode.H then
 		farmOn = not farmOn; refreshDot(farmDot, farmLbl, farmOn, Color3.fromRGB(0,200,80))
-		if farmOn then startFarm() end
+		dlog("farm -> "..tostring(farmOn)); if farmOn then startFarm() end
 	elseif input.KeyCode == Enum.KeyCode.J then
 		fightOn = not fightOn; refreshDot(fightDot, fightLbl, fightOn, Color3.fromRGB(255,160,0))
-		if fightOn then task.spawn(fightLoop) end
+		dlog("fight -> "..tostring(fightOn)); if fightOn then task.spawn(fightLoop) end
 	elseif input.KeyCode == Enum.KeyCode.U then
 		speedOn = not speedOn; refreshDot(speedDot, speedLbl, speedOn, Color3.fromRGB(0,170,255))
-		applySpeed(speedOn)
+		dlog("speed -> "..tostring(speedOn).." @"..tostring(speedVal)); applySpeed(speedOn)
 	end
 end))
 
+dlog("loaded")
 print(("[AutoHit v%s] Loaded — H=Farm  J=Fight  U=Speed"):format(VERSION))
