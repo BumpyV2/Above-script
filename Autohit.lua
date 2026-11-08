@@ -1,6 +1,6 @@
 -- Auto Hit — Farm / Fight / Speed
 -- Loader:  loadstring(game:HttpGet("<RAW_URL>?v="..tick()))()
-local VERSION = "2.4"
+local VERSION = "2.5"
 
 --------------------------------------------------------------------
 -- Teardown any previous copy (connections, loops, GUI)
@@ -180,7 +180,9 @@ end
 local function nearestHB(folders)
 	local hrp = getHRP()
 	if not hrp then return nil, nil end
-	local best, bestDist, bestModel = nil, SCAN_RANGE + 1, nil
+	-- Sentinel is SCAN_RANGE, not SCAN_RANGE+1: anything selected here must also
+	-- satisfy isAlive() below, or the caller spins without ever yielding.
+	local best, bestDist, bestModel = nil, SCAN_RANGE, nil
 	for _, folder in folders do
 		if folder and folder:IsA("Instance") then
 			for _, m in folder:GetChildren() do
@@ -318,6 +320,7 @@ end
 -- Farm — pauses during teleport
 local function farmLoop()
 	while _G._autoHitAlive and farmOn do
+		task.wait() -- unconditional yield: no branch below can spin the thread
 		if teleporting then
 			task.wait(0.5)
 			continue
@@ -326,6 +329,11 @@ local function farmLoop()
 		if #folders > 0 then
 			local hb, model = nearestHB(folders)
 			if hb then
+				if not isAlive(hb) then
+					dlog("WARN target selected but not alive: "..tostring(model and model.Name))
+					task.wait(0.2)
+					continue
+				end
 				local name = model.Name
 				if PICK_TARGETS[name] then RequestEquip:FireServer("Pickaxe")
 				elseif AXE_TARGETS[name] then RequestEquip:FireServer("Axe") end
@@ -346,6 +354,7 @@ end
 -- Fight — pauses during teleport
 local function fightLoop()
 	while _G._autoHitAlive and fightOn do
+		task.wait() -- unconditional yield: no branch below can spin the thread
 		if teleporting then
 			task.wait(0.5)
 			continue
