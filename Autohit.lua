@@ -914,19 +914,47 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.DisplayOrder = 999
 gui.Parent = guiParent
 
-local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(260, 0)
-frame.AutomaticSize = Enum.AutomaticSize.Y
-frame.Position = UDim2.new(0, 20, 0.5, -200)
-frame.BackgroundColor3 = C.bg
+-- window = title bar + scrolling body, capped to the screen height
+local win = Instance.new("Frame")
+win.Size = UDim2.fromOffset(260, 400)
+win.Position = UDim2.new(0, 20, 0, 60)
+win.BackgroundColor3 = C.bg
+win.BorderSizePixel = 0
+win.Active = true
+win.Parent = gui
+corner(win, 8)
+
+local order = 0
+local function nextOrder() order += 1; return order end
+
+-- title bar doubles as drag handle
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -20, 0, 30)
+title.Position = UDim2.fromOffset(10, 2)
+title.BackgroundTransparency = 1
+title.Text = "ABOVE Autohit  v" .. VERSION
+title.TextColor3 = C.accent
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Active = true
+title.Parent = win
+
+local frame = Instance.new("ScrollingFrame")
+frame.Position = UDim2.fromOffset(0, 32)
+frame.Size = UDim2.new(1, 0, 1, -38)
+frame.BackgroundTransparency = 1
 frame.BorderSizePixel = 0
-frame.Active = true
-frame.Parent = gui
-corner(frame, 8)
+frame.ScrollBarThickness = 4
+frame.ScrollBarImageColor3 = C.accent
+frame.ScrollingDirection = Enum.ScrollingDirection.Y
+frame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+frame.CanvasSize = UDim2.new()
+frame.Parent = win
 
 local pad = Instance.new("UIPadding")
-pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 8), UDim.new(0, 10)
-pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 10), UDim.new(0, 10)
+pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 2), UDim.new(0, 8)
+pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 10), UDim.new(0, 12)
 pad.Parent = frame
 
 local layout = Instance.new("UIListLayout")
@@ -934,33 +962,30 @@ layout.Padding = UDim.new(0, 5)
 layout.SortOrder = Enum.SortOrder.LayoutOrder
 layout.Parent = frame
 
-local order = 0
-local function nextOrder() order += 1; return order end
-
--- title bar doubles as drag handle
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, 0, 0, 24)
-title.BackgroundTransparency = 1
-title.Text = "ABOVE Autohit  v" .. VERSION
-title.TextColor3 = C.accent
-title.Font = Enum.Font.GothamBold
-title.TextSize = 15
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.LayoutOrder = nextOrder()
-title.Active = true
-title.Parent = frame
+-- fit the window to its content, but never taller than the screen
+local function fitWindow()
+	local cam = workspace.CurrentCamera
+	local screenH = cam and cam.ViewportSize.Y or 800
+	local want = layout.AbsoluteContentSize.Y + 32 + 6 + 10
+	win.Size = UDim2.fromOffset(260, math.min(want, screenH - 80))
+end
+track(layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(fitWindow))
+if workspace.CurrentCamera then
+	track(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(fitWindow))
+end
+task.defer(fitWindow)
 
 do
 	local dragging, dragStart, startPos
 	track(title.InputBegan:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-			dragging, dragStart, startPos = true, i.Position, frame.Position
+			dragging, dragStart, startPos = true, i.Position, win.Position
 		end
 	end))
 	track(UIS.InputChanged:Connect(function(i)
 		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
 			local d = i.Position - dragStart
-			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+			win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
 		end
 	end))
 	track(UIS.InputEnded:Connect(function(i)
@@ -1259,7 +1284,7 @@ track(UIS.InputBegan:Connect(function(input, gpe)
 	for name, bound in pairs(Binds) do
 		if bound ~= "" and bound == key then
 			if name == "Menu" then
-				frame.Visible = not frame.Visible
+				win.Visible = not win.Visible
 			else
 				setFeature(name, not State[name])
 			end
