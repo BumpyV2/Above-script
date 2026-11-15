@@ -689,23 +689,49 @@ local function standSpot(part, from)
 	return part.Position + flat * (half + STAND_OFF) + Vector3.new(0, 1.5, 0)
 end
 
+local TRAVEL_LIFT = 25 -- trips longer than this go up, across and down, clear of portals/spikes
+
 -- returns true on arrival; aborts if the toggle drops, the character changes or the node dies
 local function travelTo(goal, model)
 	local char, hrp = getChar(), getHRP()
 	if not (char and hrp) then return false end
 	local saved = {}
-	for _, p in ipairs(char:GetDescendants()) do if p:IsA("BasePart") then saved[p] = p.CanCollide end end
+	for _, p in ipairs(char:GetDescendants()) do
+		if p:IsA("BasePart") then saved[p] = { p.CanCollide, p.CanTouch } end
+	end
+
+	-- waypoints: straight for short hops, otherwise an arc high above both ends
+	local from = hrp.Position
+	local path = { goal }
+	if (goal - from).Magnitude > TRAVEL_LIFT then
+		local top = math.max(from.Y, goal.Y) + TRAVEL_LIFT
+		path = {
+			Vector3.new(from.X, top, from.Z),
+			Vector3.new(goal.X, top, goal.Z),
+			goal,
+		}
+	end
+	local total, prev = 0, from
+	for _, w in ipairs(path) do total += (w - prev).Magnitude; prev = w end
+
 	traveling = true
 	local ok = false
 	local t0 = os.clock()
-	local limit = (goal - hrp.Position).Magnitude / math.max(Values.TravelSpeed, 1) + 3
+	local limit = total / math.max(Values.TravelSpeed, 1) + 3
+	local i = 1
 	while alive and State.Farm and State.Travel and hrp.Parent and model.Parent do
 		local dt = RunService.Heartbeat:Wait()
-		for p in pairs(saved) do p.CanCollide = false end
-		local d = goal - hrp.Position
-		if d.Magnitude <= 0.5 then ok = true break end
-		if os.clock() - t0 > limit then break end
-		hrp.CFrame = CFrame.new(hrp.Position + d.Unit * math.min(d.Magnitude, Values.TravelSpeed * dt))
+		-- no collision (walls) and no touch (portals, spikes, kill bricks) while moving
+		for p in pairs(saved) do p.CanCollide = false; p.CanTouch = false end
+		local w = path[i]
+		local d = w - hrp.Position
+		if d.Magnitude <= 0.5 then
+			if i == #path then ok = true break end
+			i += 1
+		else
+			if os.clock() - t0 > limit then break end
+			hrp.CFrame = CFrame.new(hrp.Position + d.Unit * math.min(d.Magnitude, Values.TravelSpeed * dt))
+		end
 		hrp.AssemblyLinearVelocity = Vector3.zero
 	end
 	if ok then
@@ -718,7 +744,9 @@ local function travelTo(goal, model)
 		end
 	end
 	-- always restore collision, or the rig drops through the floor
-	for p, v in pairs(saved) do if p.Parent then p.CanCollide = v end end
+	for p, v in pairs(saved) do
+		if p.Parent then p.CanCollide = v[1]; p.CanTouch = v[2] end
+	end
 	traveling = false
 	return ok
 end
