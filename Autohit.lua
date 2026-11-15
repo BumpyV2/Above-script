@@ -1,12 +1,12 @@
 --[[
   ABOVE [ARCANE] — Autohit hub
-  Auto Farm (nodes) · Auto Fight (enemies) · Auto Bow · Magic Aim · Speed · Jump · Fly
+  Auto Farm (nodes, optional travel) · Auto Fight (enemies) · Auto Bow · Magic Aim · Speed · Jump · Fly
   Every feature has a rebindable key. Click a key button, then press the new key.
   Esc cancels a rebind, Backspace clears it. Binds and sliders persist to AboveHub.json.
   Unload: getgenv().AboveAutohit.Unload()
 ]]
 
-local VERSION = "3.0"
+local VERSION = "3.1"
 
 local Players    = game:GetService("Players")
 local RS         = game:GetService("ReplicatedStorage")
@@ -28,9 +28,13 @@ local RequestEquip  = Remotes:WaitForChild("RequestEquipSlot")
 local RequestShoot  = Remotes:FindFirstChild("RequestShoot")
 local RequestSprint = Remotes:FindFirstChild("RequestSprint")
 
-local BAL, WCFG
+local EquippedChanged = Remotes:FindFirstChild("EquippedChanged")
+local HitConfirmed    = Remotes:FindFirstChild("HitConfirmed")
+
+local BAL, WCFG, TCFG
 pcall(function() BAL  = require(RS.Shared.Ballistics) end)
 pcall(function() WCFG = require(RS.Shared.Config.WeaponConfig) end)
+pcall(function() TCFG = require(RS.Shared.Config.ToolConfig) end)
 
 --------------------------------------------------------------------
 -- State + persisted config
@@ -38,7 +42,7 @@ pcall(function() WCFG = require(RS.Shared.Config.WeaponConfig) end)
 local CONFIG_FILE = "AboveHub.json"
 
 local State = {
-	Farm = false, Fight = false, Bow = false, Magic = true, Blink = false,
+	Farm = false, Travel = false, Fight = false, Bow = false, Magic = true, Blink = false,
 	Speed = false, Jump = false, Fly = false,
 }
 
@@ -50,21 +54,33 @@ local Values = {
 	Reach    = 12,    -- melee reach in studs
 	BlinkRange = 150, -- how far Blink Shot will hop for a target
 	BlinkDepth = 8,   -- studs under the slime to shoot from (0 = beside it, visible)
+	SwingEarly = 10,  -- hundredths of a second to swing before the tool's cooldown (server slack 0.15)
+	TravelSpeed = 40, -- studs/s for Farm Travel (40 tested clean)
+	TravelRange = 400,-- how far Farm Travel will go for a node
 }
 
 local Binds = {
-	Menu = "RightShift", Farm = "H", Fight = "J", Bow = "B", Magic = "N", Blink = "V",
+	Menu = "RightShift", Farm = "H", Travel = "G", Fight = "J", Bow = "B", Magic = "N", Blink = "V",
 	Speed = "U", Jump = "K", Fly = "F",
 }
 
-local SWING_INTERVAL = 0.32 -- client cadence ~0.30s, server tolerance 0.15s
-local PICK_TARGETS = { Stone = true, Coal = true, IronOre = true, Clay = true, Sand = true, GoldOre = true }
-local AXE_TARGETS  = { Tree = true, Pine = true }
+-- Which node types Farm will hit / travel to. Filled from ToolConfig.Nodes below.
+local FarmTypes = {}
+
+-- Node rules come from the game's ToolConfig; these are the fallback if it fails to load.
+local NODE_RULES = {
+	Stone = { requires = "Pickaxe" }, Coal = { requires = "Pickaxe" }, IronOre = { requires = "Pickaxe" },
+	Clay = { requires = "Pickaxe", minTier = "Stone" }, Sand = { requires = "Pickaxe", minTier = "Stone" },
+	GoldOre = { requires = "Pickaxe", minTier = "Iron" },
+	Tree = { requires = "Axe" }, Pine = { requires = "Axe", minTier = "Iron" },
+}
+if TCFG and type(TCFG.Nodes) == "table" then NODE_RULES = TCFG.Nodes end
+for nt in pairs(NODE_RULES) do FarmTypes[nt] = true end
 
 local function saveConfig()
 	if not writefile then return end
 	pcall(function()
-		writefile(CONFIG_FILE, Http:JSONEncode({ Binds = Binds, Values = Values }))
+		writefile(CONFIG_FILE, Http:JSONEncode({ Binds = Binds, Values = Values, FarmTypes = FarmTypes }))
 	end)
 end
 
@@ -75,6 +91,7 @@ local function loadConfig()
 		local data = Http:JSONDecode(readfile(CONFIG_FILE))
 		for k, v in pairs(data.Binds or {}) do if Binds[k] ~= nil then Binds[k] = v end end
 		for k, v in pairs(data.Values or {}) do if type(v) == "number" and Values[k] then Values[k] = v end end
+		for k, v in pairs(data.FarmTypes or {}) do if FarmTypes[k] ~= nil and type(v) == "boolean" then FarmTypes[k] = v end end
 	end)
 end
 loadConfig()
@@ -119,24 +136,56 @@ local function targetAlive(inst)
 	return true
 end
 
-local nodes, enemies, lastScan = {}, {}, 0
-local function rescan()
-	local n, e = {}, {}
-	for _, d in ipairs(workspace:GetDescendants()) do
-		if d:IsA("Model") and d:GetAttribute("NodeType") then
-			n[#n + 1] = d
-		elseif d:GetAttribute("EnemyId") and (d:IsA("BasePart") or d:IsA("Model"))
-			and not Players:GetPlayerFromCharacter(d) then
-			e[#e + 1] = d
-		end
+-- Event-driven index: a full workspace:GetDescendants() every 1.5s was the biggest
+-- per-frame cost in v3.0. Now nodes/enemies are tracked as they stream in and out,
+-- with a slow full rescan as a safety net.
+local nodeSet, enemySet = {}, {}
+local nodes, enemies = {}, {}
+local listDirty = true
+local lastScan = 0
+local FULL_RESCAN = 15
+
+local function classify(d)
+	if d:IsA("Model") and d:GetAttribute("NodeType") then
+		if not nodeSet[d] then nodeSet[d] = true; listDirty = true end
+	elseif (d:IsA("BasePart") or d:IsA("Model")) and d:GetAttribute("EnemyId")
+		and not Players:GetPlayerFromCharacter(d) then
+		if not enemySet[d] then enemySet[d] = true; listDirty = true end
 	end
-	nodes, enemies, lastScan = n, e, os.clock()
 end
 
-local function nearestIn(list, origin, range)
+local function unclassify(d)
+	if nodeSet[d] then nodeSet[d] = nil; listDirty = true end
+	if enemySet[d] then enemySet[d] = nil; listDirty = true end
+end
+
+local function rebuildLists()
+	if not listDirty then return end
+	local n, e = {}, {}
+	for d in pairs(nodeSet) do if d.Parent then n[#n + 1] = d else nodeSet[d] = nil end end
+	for d in pairs(enemySet) do if d.Parent then e[#e + 1] = d else enemySet[d] = nil end end
+	nodes, enemies, listDirty = n, e, false
+end
+
+local function rescan()
+	table.clear(nodeSet); table.clear(enemySet)
+	for _, d in ipairs(workspace:GetDescendants()) do classify(d) end
+	listDirty = true
+	rebuildLists()
+	lastScan = os.clock()
+end
+
+track(workspace.DescendantAdded:Connect(function(d)
+	-- attributes are set right after the instance replicates; check on the next frame too
+	classify(d)
+	if d:IsA("Model") then task.defer(function() if d.Parent then classify(d) end end) end
+end))
+track(workspace.DescendantRemoving:Connect(unclassify))
+
+local function nearestIn(list, origin, range, accept)
 	local best, bestPart, bestD = nil, nil, range
 	for _, inst in ipairs(list) do
-		if targetAlive(inst) then
+		if (not accept or accept(inst)) and targetAlive(inst) then
 			local p = hitPart(inst)
 			if p then
 				local d = (p.Position - origin).Magnitude
@@ -144,23 +193,97 @@ local function nearestIn(list, origin, range)
 			end
 		end
 	end
-	return best, bestPart
+	return best, bestPart, bestD
 end
 
 --------------------------------------------------------------------
--- Equip (cached, re-asserted on every rescan)
+-- Equip + swing cooldown, both taken from the server's EquippedChanged
+-- (slot, itemId, cooldownSeconds). Cooldown is rolled per item.
 --------------------------------------------------------------------
-local equipped
+local curSlot           -- what the server says is in hand
+local slotItem = {}     -- slot -> itemId last seen in that slot
+local slotCooldown = {} -- slot -> server swing cooldown
+local DEFAULT_COOLDOWN = 0.65
+local pendingEquip, pendingAt = nil, 0
+
+if EquippedChanged then
+	track(EquippedChanged.OnClientEvent:Connect(function(slot, itemId, cooldown)
+		curSlot = slot
+		if slot then
+			if itemId then slotItem[slot] = itemId end
+			if type(cooldown) == "number" and cooldown > 0 then slotCooldown[slot] = cooldown end
+		end
+		if pendingEquip == slot then pendingEquip = nil end
+	end))
+end
+
+-- read what the game already has in hand at load time
+pcall(function()
+	local AC = require(lp.PlayerScripts.Client.Controllers.AnimationController)
+	local ups = debug.getupvalues(AC.playSwing)
+	local cd, slot = ups[3], ups[4]
+	if type(slot) == "string" and type(cd) == "number" then curSlot = slot; slotCooldown[slot] = cd end
+end)
+pcall(function()
+	local ht = lp.Character and lp.Character:FindFirstChild("HeldTool")
+	local id = ht and ht:GetAttribute("ItemId")
+	if id and curSlot then slotItem[curSlot] = id end
+end)
+
 local function equip(slot)
-	if slot and slot ~= equipped then
-		RequestEquip:FireServer(slot)
-		equipped = slot
-	end
+	if not slot or slot == curSlot then return true end
+	-- one request in flight at a time; re-asking resets the swing timer server-side
+	if pendingEquip == slot and os.clock() - pendingAt < 0.8 then return false end
+	pendingEquip, pendingAt = slot, os.clock()
+	RequestEquip:FireServer(slot)
+	return false
+end
+
+local function swingInterval(slot)
+	local cd = slotCooldown[slot] or DEFAULT_COOLDOWN
+	return math.max(0.1, cd - Values.SwingEarly / 100)
 end
 
 local function slotForNode(model)
 	local nt = model:GetAttribute("NodeType") or model.Name
-	return (PICK_TARGETS[nt] and "Pickaxe") or (AXE_TARGETS[nt] and "Axe")
+	local rule = NODE_RULES[nt]
+	return rule and rule.requires
+end
+
+-- false only when we KNOW the tool in that slot is below the node's minTier
+local function tierOk(nt, slot)
+	local rule = NODE_RULES[nt]
+	if not (rule and rule.minTier and TCFG and TCFG.TierRank and TCFG.Tools) then return true end
+	local item = slotItem[slot]
+	local tool = item and TCFG.Tools[item]
+	if not tool then return true end
+	local have, need = TCFG.TierRank[tool.tier], TCFG.TierRank[rule.minTier]
+	return not (have and need) or have >= need
+end
+
+-- nodes the server refused (tier, ownership, anything we don't model) get benched
+local nodeBench = setmetatable({}, { __mode = "k" })
+local nodeRefusals = setmetatable({}, { __mode = "k" })
+if HitConfirmed then
+	track(HitConfirmed.OnClientEvent:Connect(function(inst, result)
+		if typeof(inst) ~= "Instance" or not nodeSet[inst] then return end
+		if result == "Hit" or result == "Destroyed" then
+			nodeRefusals[inst] = nil
+		else
+			local n = (nodeRefusals[inst] or 0) + 1
+			nodeRefusals[inst] = n
+			if n >= 3 then nodeBench[inst] = os.clock() + 20; nodeRefusals[inst] = nil end
+		end
+	end))
+end
+
+local function nodeEligible(model)
+	local nt = model:GetAttribute("NodeType")
+	if not (nt and FarmTypes[nt]) then return false end
+	local b = nodeBench[model]
+	if b and os.clock() < b then return false end
+	local slot = slotForNode(model)
+	return slot ~= nil and tierOk(nt, slot)
 end
 
 --------------------------------------------------------------------
@@ -302,8 +425,8 @@ local function bowLoop()
 		if hrp and (target or not State.Magic) then
 			-- only re-equip when the bow isn't already out: re-equipping restarts the draw timer
 			if not heldProjectile() then
-				equipped = nil
-				equip("Weapon")
+				pendingEquip = nil
+				RequestEquip:FireServer("Weapon")
 				task.wait(0.4)
 			end
 			local proj = heldProjectile()
@@ -395,35 +518,141 @@ end
 -- Melee scheduler: Fight (enemies) has priority over Farm (nodes)
 --------------------------------------------------------------------
 local lastSwing = 0
+local farmTarget -- sticky: finish one node before starting the next (nodes heal when left alone)
+local traveling = false
+
+local function swingReady(slot)
+	return os.clock() - lastSwing >= swingInterval(slot)
+end
+
 track(RunService.Heartbeat:Connect(function()
 	if not alive then return end
-	if os.clock() - lastScan > 1.5 then
-		rescan()
-		equipped = nil
-	end
+	if os.clock() - lastScan > FULL_RESCAN then rescan() else rebuildLists() end
 	if not (State.Farm or State.Fight) then return end
-	if os.clock() - lastSwing < SWING_INTERVAL then return end
 	local hrp = getHRP()
 	if not hrp then return end
 
 	if State.Fight and not State.Bow then
 		local _, part = nearestIn(enemies, hrp.Position, Values.Reach)
 		if part then
-			lastSwing = os.clock()
-			equip("Weapon")
-			RequestSwing:FireServer(part)
+			if equip("Weapon") and swingReady("Weapon") then
+				lastSwing = os.clock()
+				RequestSwing:FireServer(part)
+			end
 			return
 		end
 	end
 	if State.Farm and not bowBusy then
-		local model, part = nearestIn(nodes, hrp.Position, Values.Reach)
+		local model, part
+		if farmTarget and farmTarget.Parent and nodeEligible(farmTarget) then
+			local p = hitPart(farmTarget)
+			if p and (p.Position - hrp.Position).Magnitude <= Values.Reach then model, part = farmTarget, p end
+		end
+		if not model then
+			model, part = nearestIn(nodes, hrp.Position, Values.Reach, nodeEligible)
+			farmTarget = model
+		end
 		if part then
-			lastSwing = os.clock()
-			equip(slotForNode(model))
-			RequestSwing:FireServer(part)
+			local slot = slotForNode(model)
+			if equip(slot) and swingReady(slot) then
+				lastSwing = os.clock()
+				RequestSwing:FireServer(part)
+			end
 		end
 	end
 end))
+
+--------------------------------------------------------------------
+-- Farm Travel: fly (noclip, stepped CFrame) to the nearest eligible node,
+-- stand beside it, let the scheduler above break it, repeat.
+-- Server reach is ~16 studs (20 is refused); we stand 5 off the hitbox.
+--------------------------------------------------------------------
+local STAND_OFF = 5
+local seatBlocked = false
+
+local function blockSeats(on)
+	local hum = getHum()
+	if not hum then return end
+	if on and not seatBlocked then
+		hum:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+		if hum.SeatPart then hum.Sit = false end
+		seatBlocked = true
+	elseif not on and seatBlocked then
+		hum:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+		seatBlocked = false
+	end
+end
+
+local function standSpot(part, from)
+	local flat = (from - part.Position) * Vector3.new(1, 0, 1)
+	flat = flat.Magnitude > 0.1 and flat.Unit or Vector3.xAxis
+	local half = math.max(part.Size.X, part.Size.Z) / 2
+	return part.Position + flat * (half + STAND_OFF) + Vector3.new(0, 1.5, 0)
+end
+
+-- returns true on arrival; aborts if the toggle drops, the character changes or the node dies
+local function travelTo(goal, model)
+	local char, hrp = getChar(), getHRP()
+	if not (char and hrp) then return false end
+	local saved = {}
+	for _, p in ipairs(char:GetDescendants()) do if p:IsA("BasePart") then saved[p] = p.CanCollide end end
+	traveling = true
+	local ok = false
+	local t0 = os.clock()
+	local limit = (goal - hrp.Position).Magnitude / math.max(Values.TravelSpeed, 1) + 3
+	while alive and State.Farm and State.Travel and hrp.Parent and model.Parent do
+		local dt = RunService.Heartbeat:Wait()
+		for p in pairs(saved) do p.CanCollide = false end
+		local d = goal - hrp.Position
+		if d.Magnitude <= 0.5 then ok = true break end
+		if os.clock() - t0 > limit then break end
+		hrp.CFrame = CFrame.new(hrp.Position + d.Unit * math.min(d.Magnitude, Values.TravelSpeed * dt))
+		hrp.AssemblyLinearVelocity = Vector3.zero
+	end
+	if ok then
+		-- hold a few frames so the server's smoothed position catches up before we swing
+		for _ = 1, 8 do
+			if not hrp.Parent then break end
+			hrp.CFrame = CFrame.new(goal)
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			RunService.Heartbeat:Wait()
+		end
+	end
+	-- always restore collision, or the rig drops through the floor
+	for p, v in pairs(saved) do if p.Parent then p.CanCollide = v end end
+	traveling = false
+	return ok
+end
+
+local travelRunning = false
+local function travelLoop()
+	if travelRunning then return end
+	travelRunning = true
+	blockSeats(true)
+	while alive and State.Travel do
+		local hrp = getHRP()
+		if not (State.Farm and hrp) or bowBusy then
+			task.wait(0.25)
+		else
+			local here = nearestIn(nodes, hrp.Position, Values.Reach, nodeEligible)
+			if here then
+				task.wait(0.1) -- scheduler is working a node in reach
+			else
+				local model, part = nearestIn(nodes, hrp.Position, Values.TravelRange, nodeEligible)
+				if model then
+					farmTarget = model
+					-- equip on the way so the first swing lands on arrival
+					equip(slotForNode(model))
+					if not travelTo(standSpot(part, hrp.Position), model) then task.wait(0.2) end
+				else
+					task.wait(0.5) -- nothing in range: wait for respawns
+				end
+			end
+		end
+	end
+	blockSeats(false)
+	travelRunning = false
+end
 
 --------------------------------------------------------------------
 -- Speed / Jump — polled, so the game's sprint script can't storm a listener
@@ -506,8 +735,10 @@ end))
 track(lp.CharacterAdded:Connect(function(char)
 	char:WaitForChild("HumanoidRootPart", 10)
 	task.wait(0.5)
-	equipped = nil
+	curSlot, pendingEquip, farmTarget = nil, nil, nil
 	flyParts = nil
+	seatBlocked = false
+	if State.Travel then blockSeats(true) end
 	if State.Fly then startFly() end
 	if State.Bow then setAim(true) end
 end))
@@ -521,6 +752,13 @@ local function setFeature(name, on)
 	State[name] = on
 	if name == "Bow" then
 		if on then task.spawn(bowLoop) end
+	elseif name == "Travel" then
+		if on then
+			if not State.Farm then State.Farm = true; if Features and Features.Farm then Features.Farm.refresh() end end
+			task.spawn(travelLoop)
+		end
+	elseif name == "Farm" then
+		if not on then farmTarget = nil end
 	elseif name == "Speed" then
 		if not on then resetSpeed() end
 	elseif name == "Jump" then
@@ -757,10 +995,55 @@ local function slider(label, key, minV, maxV, suffix)
 	render()
 end
 
-section("Combat / Gather")
-featureRow("Farm",  "Auto Farm")
+local function typeChips()
+	local holder = Instance.new("Frame")
+	holder.Size = UDim2.new(1, 0, 0, 0)
+	holder.AutomaticSize = Enum.AutomaticSize.Y
+	holder.BackgroundTransparency = 1
+	holder.LayoutOrder = nextOrder()
+	holder.Parent = frame
+	local grid = Instance.new("UIGridLayout")
+	grid.CellSize = UDim2.new(0.25, -4, 0, 20)
+	grid.CellPadding = UDim2.fromOffset(4, 4)
+	grid.SortOrder = Enum.SortOrder.Name
+	grid.Parent = holder
+	local names = {}
+	for nt in pairs(FarmTypes) do names[#names + 1] = nt end
+	table.sort(names)
+	for _, nt in ipairs(names) do
+		local b = Instance.new("TextButton")
+		b.Name = nt
+		b.Text = nt
+		b.Font = Enum.Font.GothamMedium
+		b.TextSize = 11
+		b.AutoButtonColor = true
+		b.BorderSizePixel = 0
+		b.Parent = holder
+		corner(b, 4)
+		local function paint()
+			b.BackgroundColor3 = FarmTypes[nt] and C.on or C.off
+			b.TextColor3 = FarmTypes[nt] and C.bg or C.dim
+		end
+		paint()
+		track(b.MouseButton1Click:Connect(function()
+			FarmTypes[nt] = not FarmTypes[nt]
+			if farmTarget and farmTarget:GetAttribute("NodeType") == nt then farmTarget = nil end
+			paint(); saveConfig()
+		end))
+	end
+end
+
+section("Farm")
+featureRow("Farm",   "Auto Farm")
+featureRow("Travel", "Farm Travel (go to nodes)")
+typeChips()
+slider("Reach", "Reach", 4, 16, " studs")
+slider("Swing early (0.01s, server slack 0.15)", "SwingEarly", 0, 14, "")
+slider("Travel speed", "TravelSpeed", 15, 80, " st/s")
+slider("Travel range", "TravelRange", 50, 1000, " studs")
+
+section("Combat")
 featureRow("Fight", "Auto Fight")
-slider("Reach", "Reach", 4, 20, " studs")
 featureRow("Bow",   "Auto Bow")
 featureRow("Magic", "Magic Aim")
 featureRow("Blink", "Blink Shot")
@@ -840,11 +1123,17 @@ end))
 -- Unload
 --------------------------------------------------------------------
 env.AboveAutohit = {
-	State = State, Values = Values, Binds = Binds, Set = setFeature,
+	State = State, Values = Values, Binds = Binds, FarmTypes = FarmTypes, Set = setFeature,
+	Debug = function()
+		return { slot = curSlot, items = slotItem, cooldowns = slotCooldown, target = farmTarget,
+			nodes = #nodes, enemies = #enemies, traveling = traveling }
+	end,
 	Unload = function()
 		alive = false
 		State.Bow = false
+		State.Travel = false
 		setAim(false)
+		blockSeats(false)
 		if State.Fly then stopFly() end
 		if State.Speed then resetSpeed() end
 		if State.Jump then resetJump() end
