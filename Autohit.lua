@@ -6,7 +6,7 @@
   Unload: getgenv().AboveAutohit.Unload()
 ]]
 
-local VERSION = "3.3"
+local VERSION = "3.4"
 
 local Players    = game:GetService("Players")
 local RS         = game:GetService("ReplicatedStorage")
@@ -44,7 +44,7 @@ local CONFIG_FILE = "AboveHub.json"
 
 local State = {
 	Farm = false, Travel = false, Fight = false, Bow = false, Magic = true, Blink = false,
-	Speed = false, Jump = false, Fly = false, FlyNoclip = true,
+	Speed = false, Jump = false, Fly = false, FlyNoclip = true, QuickShot = false,
 }
 
 local Values = {
@@ -60,11 +60,12 @@ local Values = {
 	TravelRange = 400,-- how far Farm Travel will go for a node
 	BowRange = 300,   -- Auto Bow target range without Blink
 	BowLead = 100,    -- % of measured target velocity to lead by (0 = aim at body)
+	QuickHold = 36,   -- hundredths of a second Farm waits after a quick shot before swinging again
 }
 
 local Binds = {
 	Menu = "RightShift", Farm = "H", Travel = "G", Fight = "J", Bow = "B", Magic = "N", Blink = "V",
-	Speed = "U", Jump = "K", Fly = "F", FlyNoclip = "",
+	Speed = "U", Jump = "K", Fly = "F", FlyNoclip = "", QuickShot = "",
 }
 
 -- Which enemy kinds Auto Bow shoots (EnemyId -> bool). Filled from EnemyConfig later.
@@ -301,11 +302,8 @@ end
 -- Bow
 --------------------------------------------------------------------
 local projCache = {}
-local function heldProjectile()
+local function projectileFor(id)
 	if not WCFG then return end
-	local c = getChar()
-	local ht = c and c:FindFirstChild("HeldTool")
-	local id = ht and ht:GetAttribute("ItemId")
 	local w = id and WCFG.Weapons and WCFG.Weapons[id]
 	if not (w and w.ranged) then return end
 	if projCache[id] == nil then
@@ -313,6 +311,11 @@ local function heldProjectile()
 		projCache[id] = (ok and type(cfg) == "table") and cfg or false
 	end
 	return projCache[id] or nil
+end
+local function heldProjectile()
+	local c = getChar()
+	local ht = c and c:FindFirstChild("HeldTool")
+	return projectileFor(ht and ht:GetAttribute("ItemId"))
 end
 
 local function aimAt(origin, target, proj, draw)
@@ -479,6 +482,16 @@ local traveling = false -- Farm Travel is mid-trip (set in travelTo below)
 local BOW_TURN = 2
 local bowTurnShots = 0
 
+-- Quick shot: instead of taking a turn, the bow hands its target to the melee scheduler,
+-- which swaps to the bow, shoots and swaps back in the same frame right after a swing.
+-- The server accepts a shot fired in the same frame as the equip.
+local quickTarget -- set by bowLoop, consumed by the scheduler
+local function quickReady(hrp, target)
+	return State.QuickShot and target ~= nil and not traveling
+		and (State.Farm or State.Travel) and farmHasNode(hrp)
+		and projectileFor(slotItem.Weapon) ~= nil
+end
+
 local function farmHasNode(hrp)
 	return nearestIn(nodes, hrp.Position, Values.Reach, nodeEligible) ~= nil
 end
@@ -543,6 +556,17 @@ local function bowLoop()
 			end
 		end
 		local yield = bowShouldYield(hrp, target)
+		if yield and quickReady(hrp, target) then
+			trackVelocity(target)
+			bowBusy = false
+			quickTarget = target
+			local t0 = os.clock()
+			while quickTarget and alive and State.Bow and os.clock() - t0 < 1.5 do RunService.Heartbeat:Wait() end
+			quickTarget = nil
+			local proj = projectileFor(slotItem.Weapon)
+			task.wait((proj and proj.cooldownSeconds or 1.25) + 0.03)
+			continue
+		end
 		if yield then target = nil end
 		trackVelocity(target)
 		bowBusy = target ~= nil
@@ -649,8 +673,37 @@ end
 local lastSwing = 0
 local farmTarget -- sticky: finish one node before starting the next (nodes heal when left alone)
 
+local swingHoldUntil = 0
 local function swingReady(slot)
-	return os.clock() - lastSwing >= swingInterval(slot)
+	return os.clock() >= swingHoldUntil and os.clock() - lastSwing >= swingInterval(slot)
+end
+
+local quickShotId = math.random(2e6, 3e6)
+local function fireQuickShot(hrp, farmSlot)
+	local target = quickTarget
+	quickTarget = nil
+	if not (target and target.Parent and farmSlot) then return end
+	local proj = projectileFor(slotItem.Weapon)
+	if not proj then return end
+	local draw = math.clamp(Values.Draw / 100, 0.12, 1)
+	local origin = hrp.Position + Vector3.new(0, 1.5, 0)
+	local aimPos = leadPosition(origin, target, proj, draw)
+	local rel = aimPos - origin
+	local push = math.min(rel.Magnitude - 1.5, SHOT_SLACK)
+	if push > 0 then
+		origin += rel.Unit * push
+		aimPos = leadPosition(origin, target, proj, draw)
+	end
+	local dir = aimAt(origin, aimPos, proj, draw)
+	if not dir then return end
+	quickShotId += 1
+	RequestEquip:FireServer("Weapon")
+	RequestShoot:FireServer(origin, dir, draw, quickShotId)
+	RequestEquip:FireServer(farmSlot)
+	-- the server echoes Weapon then the farm tool; hold the scheduler until it settles
+	curSlot = farmSlot
+	pendingEquip, pendingAt = farmSlot, os.clock()
+	swingHoldUntil = os.clock() + Values.QuickHold / 100
 end
 
 track(RunService.Heartbeat:Connect(function()
@@ -686,6 +739,7 @@ track(RunService.Heartbeat:Connect(function()
 			if equip(slot) and swingReady(slot) then
 				lastSwing = os.clock()
 				RequestSwing:FireServer(part)
+				if quickTarget then fireQuickShot(hrp, slot) end
 			end
 		end
 	end
@@ -1259,6 +1313,8 @@ featureRow("Fight", "Auto Fight")
 featureRow("Bow",   "Auto Bow")
 featureRow("Magic", "Magic Aim")
 featureRow("Blink", "Blink Shot")
+featureRow("QuickShot", "Quick shot (swap mid-farm)")
+slider("Quick shot pause (0.01s)", "QuickHold", 0, 100, "")
 do
 	-- mobs ordered weakest to strongest, bosses on their own row
 	local hpOf = function(id)
