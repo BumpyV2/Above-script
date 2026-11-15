@@ -191,6 +191,22 @@ local function shotOrigin(hrp)
 	return hrp.Position
 end
 
+local BLINK_DWELL = 0.35 -- tested: 0.12s is too short at 40ms ping, 0.35s lands consistently
+
+-- Some guardians take arrows without losing health. Track health per shot and
+-- skip a target for a while once two clean hits did nothing.
+local immuneUntil = setmetatable({}, { __mode = "k" })
+local noDamage = setmetatable({}, { __mode = "k" })
+local function healthOf(part)
+	local bar = part:FindFirstChild("Health")
+	bar = bar and bar:FindFirstChild("Bar")
+	return bar and bar.Size.X.Scale
+end
+local function isImmune(part)
+	local t = immuneUntil[part]
+	return t and os.clock() < t
+end
+
 -- nearest enemy the arrow can actually reach: a blocked line just buries the arrow in a ledge
 local losParams = RaycastParams.new()
 losParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -201,7 +217,7 @@ local function nearestVisibleEnemy(origin, range)
 	for _, inst in ipairs(enemies) do
 		if targetAlive(inst) then
 			local p = hitPart(inst)
-			if p then
+			if p and not isImmune(p) then
 				local rel = p.Position - origin
 				local d = rel.Magnitude
 				if d < bestD then
@@ -234,8 +250,14 @@ local function bowLoop()
 		if hrp and State.Magic then
 			if State.Blink then
 				-- blink ignores walls: we fire from right above the target
-				local _, part = nearestIn(enemies, hrp.Position, Values.BlinkRange)
-				target = part
+				local bestD = Values.BlinkRange
+				for _, inst in ipairs(enemies) do
+					local p = targetAlive(inst) and hitPart(inst)
+					if p and not isImmune(p) then
+						local d = (p.Position - hrp.Position).Magnitude
+						if d < bestD then target, bestD = p, d end
+					end
+				end
 			else
 				target = nearestVisibleEnemy(shotOrigin(hrp), 300)
 			end
@@ -254,9 +276,15 @@ local function bowLoop()
 				local home
 				if target and State.Blink then
 					home = hrp.CFrame
-					hrp.CFrame = CFrame.new(target.Position + Vector3.new(0, 6, 6), target.Position)
-					for _ = 1, 3 do RunService.Heartbeat:Wait() end
-					task.wait(0.12) -- let the position replicate before the shot arrives
+					-- Hold the spot for a moment. A single CFrame set gets interpolated server-side,
+					-- so the shot is either rejected or fired from somewhere mid-path.
+					local stand = CFrame.new(target.Position + Vector3.new(0, 6, 6), target.Position)
+					local t0 = os.clock()
+					while os.clock() - t0 < BLINK_DWELL do
+						hrp.CFrame = stand
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						RunService.Heartbeat:Wait()
+					end
 				end
 				local origin = shotOrigin(hrp)
 				local aimPos
@@ -278,6 +306,21 @@ local function bowLoop()
 					task.wait(0.15)
 					local r = getHRP()
 					if r then r.CFrame = home; r.AssemblyLinearVelocity = Vector3.zero end
+				end
+				if target then
+					local before = healthOf(target)
+					task.delay(0.6, function()
+						if not target.Parent then noDamage[target] = nil return end
+						if before and healthOf(target) == before then
+							noDamage[target] = (noDamage[target] or 0) + 1
+							if noDamage[target] >= 2 then
+								immuneUntil[target] = os.clock() + 30
+								noDamage[target] = 0
+							end
+						else
+							noDamage[target] = 0
+						end
+					end)
 				end
 				-- server gates on cooldown AND draw time; firing faster is discarded
 				local wait = math.max(proj.cooldownSeconds or 0.25, draw * (proj.drawSeconds or 1)) + 0.03
