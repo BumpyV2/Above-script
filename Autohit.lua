@@ -627,7 +627,7 @@ end
 track(RunService.Heartbeat:Connect(function()
 	if not alive then return end
 	if os.clock() - lastScan > FULL_RESCAN then rescan() else rebuildLists() end
-	if not (State.Farm or State.Fight) then return end
+	if not (State.Farm or State.Travel or State.Fight) then return end
 	local hrp = getHRP()
 	if not hrp then return end
 
@@ -641,7 +641,8 @@ track(RunService.Heartbeat:Connect(function()
 			return
 		end
 	end
-	if State.Farm and not bowBusy then
+	-- Auto Farm and Farm Travel are separate toggles; either one swings at nodes in reach
+	if (State.Farm or State.Travel) and not bowBusy then
 		local model, part
 		if farmTarget and farmTarget.Parent and nodeEligible(farmTarget) then
 			local p = hitPart(farmTarget)
@@ -719,7 +720,7 @@ local function travelTo(goal, model)
 	local t0 = os.clock()
 	local limit = total / math.max(Values.TravelSpeed, 1) + 3
 	local i = 1
-	while alive and State.Farm and State.Travel and hrp.Parent and model.Parent do
+	while alive and State.Travel and hrp.Parent and model.Parent do
 		local dt = RunService.Heartbeat:Wait()
 		-- no collision (walls) and no touch (portals, spikes, kill bricks) while moving
 		for p in pairs(saved) do p.CanCollide = false; p.CanTouch = false end
@@ -758,7 +759,7 @@ local function travelLoop()
 	blockSeats(true)
 	while alive and State.Travel do
 		local hrp = getHRP()
-		if not (State.Farm and hrp) or bowBusy then
+		if not hrp or bowBusy then
 			task.wait(0.25)
 		else
 			local here = nearestIn(nodes, hrp.Position, Values.Reach, nodeEligible)
@@ -905,11 +906,12 @@ local function setFeature(name, on)
 		if on then task.spawn(bowLoop) end
 	elseif name == "Travel" then
 		if on then
-			if not State.Farm then State.Farm = true; if Features and Features.Farm then Features.Farm.refresh() end end
 			task.spawn(travelLoop)
+		elseif not State.Farm then
+			farmTarget = nil
 		end
 	elseif name == "Farm" then
-		if not on then farmTarget = nil end
+		if not (on or State.Travel) then farmTarget = nil end
 	elseif name == "Speed" then
 		if not on then resetSpeed() end
 	elseif name == "Jump" then
