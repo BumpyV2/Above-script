@@ -486,6 +486,7 @@ local bowTurnShots = 0
 -- which swaps to the bow, shoots and swaps back in the same frame right after a swing.
 -- The server accepts a shot fired in the same frame as the equip.
 local quickTarget -- set by bowLoop, consumed by the scheduler
+local quickStats = { offered = 0, fired = 0, noTarget = 0, noProj = 0, noDir = 0, expired = 0 }
 local function quickReady(hrp, target)
 	return State.QuickShot and target ~= nil and not traveling
 		and (State.Farm or State.Travel) and farmHasNode(hrp)
@@ -560,8 +561,10 @@ local function bowLoop()
 			trackVelocity(target)
 			bowBusy = false
 			quickTarget = target
+			quickStats.offered += 1
 			local t0 = os.clock()
 			while quickTarget and alive and State.Bow and os.clock() - t0 < 1.5 do RunService.Heartbeat:Wait() end
+			if quickTarget then quickStats.expired += 1 end
 			quickTarget = nil
 			local proj = projectileFor(slotItem.Weapon)
 			task.wait((proj and proj.cooldownSeconds or 1.25) + 0.03)
@@ -682,9 +685,9 @@ local quickShotId = math.random(2e6, 3e6)
 local function fireQuickShot(hrp, farmSlot)
 	local target = quickTarget
 	quickTarget = nil
-	if not (target and target.Parent and farmSlot) then return end
+	if not (target and target.Parent and farmSlot) then quickStats.noTarget += 1 return end
 	local proj = projectileFor(slotItem.Weapon)
-	if not proj then return end
+	if not proj then quickStats.noProj += 1 return end
 	local draw = math.clamp(Values.Draw / 100, 0.12, 1)
 	local origin = hrp.Position + Vector3.new(0, 1.5, 0)
 	local aimPos = leadPosition(origin, target, proj, draw)
@@ -695,8 +698,9 @@ local function fireQuickShot(hrp, farmSlot)
 		aimPos = leadPosition(origin, target, proj, draw)
 	end
 	local dir = aimAt(origin, aimPos, proj, draw)
-	if not dir then return end
+	if not dir then quickStats.noDir += 1 return end
 	quickShotId += 1
+	quickStats.fired += 1
 	RequestEquip:FireServer("Weapon")
 	RequestShoot:FireServer(origin, dir, draw, quickShotId)
 	RequestEquip:FireServer(farmSlot)
@@ -1415,7 +1419,7 @@ env.AboveAutohit = {
 	State = State, Values = Values, Binds = Binds, FarmTypes = FarmTypes, ShootTypes = ShootTypes, Set = setFeature,
 	Debug = function()
 		return { slot = curSlot, items = slotItem, cooldowns = slotCooldown, target = farmTarget,
-			nodes = #nodes, enemies = #enemies, traveling = traveling,
+			nodes = #nodes, enemies = #enemies, traveling = traveling, quick = quickStats,
 			bowTarget = velTarget, bowVel = velEst }
 	end,
 	Unload = function()
