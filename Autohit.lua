@@ -951,7 +951,7 @@ task.spawn(function()
 				task.wait(0.5)
 			end
 		end
-		task.wait(30)
+		task.wait(60)
 	end
 end)
 
@@ -1028,16 +1028,18 @@ local function runTrip()
 			end
 		end
 
-		-- ores: split each kind over the furnaces, QUEUE_MAX per request
-		local jobs = { { "IronOre", "IronIngot" }, { "GoldOre", "GoldIngot" } }
+		-- ores: split each kind evenly over the furnaces, from one inventory snapshot
+		-- (the server's inventory update lags the request, so re-reading mid-loop over-asks)
+		local jobs = { { "IronOre", "IronIngot", have("IronOre") }, { "GoldOre", "GoldIngot", have("GoldOre") } }
 		for i, f in ipairs(furnaces) do
 			stepTo(f)
 			local key = f:GetAttribute("CellKey")
 			if State.AutoFuel then fuelFurnace(key) end
 			for _, job in ipairs(jobs) do
 				local left = #furnaces - i + 1
-				local n = math.min(QUEUE_MAX, math.ceil(have(job[1]) / left))
+				local n = math.min(QUEUE_MAX, math.ceil(job[3] / left))
 				if n > 0 then
+					job[3] -= n
 					RequestCraft:FireServer(key, job[2], n)
 					tripStats.smelts += n
 					task.wait(0.4)
