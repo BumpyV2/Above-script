@@ -204,6 +204,7 @@ local function shotOrigin(hrp)
 	return hrp.Position
 end
 
+local BLINK_SIDE = 2.5 -- horizontal offset of the launch point from the slime
 local BLINK_DWELL = 0.35 -- tested: 0.12s is too short at 40ms ping, 0.35s lands consistently
 
 -- Some guardians take arrows without losing health. Track health per shot and
@@ -315,8 +316,9 @@ local function bowLoop()
 					-- Stand BlinkDepth studs under the slime (0 = beside it, above ground), noclipped.
 					-- Hold the spot for a moment: a single CFrame set gets interpolated server-side,
 					-- so the shot is either rejected or fired from somewhere mid-path.
+					-- stand under (or beside) the slime, offset to the same side the arrow will come from
 					local stand = Values.BlinkDepth > 0
-						and CFrame.new(target.Position - Vector3.new(0, Values.BlinkDepth, 0))
+						and CFrame.new(target.Position + Vector3.new(0, -Values.BlinkDepth, BLINK_SIDE))
 						or CFrame.new(target.Position + Vector3.new(0, 6, 6), target.Position)
 					local char = getChar()
 					local t0 = os.clock()
@@ -330,11 +332,20 @@ local function bowLoop()
 				local origin = shotOrigin(hrp)
 				local aimPos
 				if target then
-					-- server accepts a launch point up to ShotOriginSlackStuds (12) from the bow:
-					-- spawn the arrow as close to the target as that allows
-					local rel = target.Position - origin
-					local push = math.min(rel.Magnitude - 1.5, SHOT_SLACK)
-					if push > 0 then origin += rel.Unit * push end
+					-- server accepts a launch point up to ShotOriginSlackStuds (12) from the bow
+					local bow = origin
+					if home and Values.BlinkDepth > 0 then
+						-- Underground: launching from the bow (or pushed straight up) starts the arrow
+						-- inside the terrain. Launch from beside the slime at its own height instead.
+						origin = target.Position + Vector3.new(0, 0.5, BLINK_SIDE)
+						local off = origin - bow
+						if off.Magnitude > SHOT_SLACK then origin = bow + off.Unit * SHOT_SLACK end
+					else
+						-- spawn the arrow as close to the target as the slack allows
+						local rel = target.Position - origin
+						local push = math.min(rel.Magnitude - 1.5, SHOT_SLACK)
+						if push > 0 then origin += rel.Unit * push end
+					end
 					aimPos = target.Position
 				end
 				local dir = aimPos and aimAt(origin, aimPos, proj, draw)
