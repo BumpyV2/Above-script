@@ -59,6 +59,7 @@ local Values = {
 	TravelSpeed = 40, -- studs/s for Farm Travel (40 tested clean)
 	TravelRange = 400,-- how far Farm Travel will go for a node
 	BowRange = 300,   -- Auto Bow target range without Blink
+	BowLead = 100,    -- % of measured target velocity to lead by (0 = aim at body)
 }
 
 local Binds = {
@@ -452,13 +453,13 @@ end))
 -- where to aim so a moving target walks into the arrow
 local function leadPosition(origin, part, proj, draw)
 	local pos = part.Position
-	if part ~= velTarget or velEst.Magnitude < 0.5 then return pos end
+	if part ~= velTarget or velEst.Magnitude < 0.5 or Values.BowLead <= 0 then return pos end
 	local speed = 150
 	if WCFG and proj then
 		local ok, s = pcall(WCFG.launchSpeed, proj, draw)
 		if ok and type(s) == "number" and s > 0 then speed = s end
 	end
-	local flat = Vector3.new(velEst.X, 0, velEst.Z) -- ground mobs: ignore bobbing
+	local flat = Vector3.new(velEst.X, 0, velEst.Z) * (Values.BowLead / 100) -- ground mobs: ignore bobbing
 	local aim = pos
 	for _ = 1, 2 do
 		local t = (aim - origin).Magnitude / speed + 0.05 -- + server tick
@@ -1169,6 +1170,7 @@ do
 	chips(ShootTypes, bosses, unlock)
 end
 slider("Bow range", "BowRange", 50, 500, " studs")
+slider("Bow lead (moving targets)", "BowLead", 0, 150, "%")
 slider("Blink range", "BlinkRange", 20, 300, " studs")
 slider("Blink depth (0 = above ground)", "BlinkDepth", 0, 15, " studs")
 slider("Bow draw (low = fast, high = damage)", "Draw", 12, 100, "%")
