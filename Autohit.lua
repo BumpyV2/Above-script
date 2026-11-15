@@ -6,7 +6,7 @@
   Unload: getgenv().AboveAutohit.Unload()
 ]]
 
-local VERSION = "3.5"
+local VERSION = "3.6"
 
 local Players    = game:GetService("Players")
 local RS         = game:GetService("ReplicatedStorage")
@@ -45,7 +45,7 @@ local CONFIG_FILE = "AboveHub.json"
 local State = {
 	Farm = false, Travel = false, Fight = false, Bow = false, Magic = true, Blink = false,
 	Speed = false, Jump = false, Fly = false, FlyNoclip = true, QuickShot = false,
-	AutoFuel = false, AutoSmelt = false,
+	AutoFuel = false, AutoSmelt = false, Slime = false,
 }
 
 local Values = {
@@ -66,11 +66,14 @@ local Values = {
 	ArrowTarget = 150,-- Auto smelt: craft arrows on a trip while you have fewer than this
 	KeepWood = 50,    -- Auto smelt: wood never spent on arrows
 	KeepCoal = 0,     -- Auto fuel: coal kept in the inventory
+	ArrowLow = 50,    -- Slime: under this many arrows, go craft more
+	WoodLow = 200,    -- Slime: under this much wood, switch to farming trees
+	WoodTarget = 10000, -- Slime: farm trees until this much wood, then back to slimes
 }
 
 local Binds = {
 	Menu = "RightShift", Farm = "H", Travel = "G", Fight = "J", Bow = "B", Magic = "N", Blink = "V",
-	Speed = "U", Jump = "K", Fly = "F", FlyNoclip = "", QuickShot = "", AutoFuel = "", AutoSmelt = "",
+	Speed = "U", Jump = "K", Fly = "F", FlyNoclip = "", QuickShot = "", AutoFuel = "", AutoSmelt = "", Slime = "",
 }
 
 -- Which enemy kinds Auto Bow shoots (EnemyId -> bool). Filled from EnemyConfig later.
@@ -95,6 +98,8 @@ for nt in pairs(NODE_RULES) do FarmTypes[nt] = true end
 
 -- island machines by kind: { Furnace = { cellKey, ... }, Toolsmith = { ... } }; learned on island visits
 local Machines = { Furnace = {}, Toolsmith = {} }
+local setFeature -- defined with the GUI further down; Slime calls it from its loop
+local farmOnly -- NodeType the farm is limited to (Slime's wood phase), nil = use FarmTypes
 
 local function saveConfig()
 	if not writefile then return end
@@ -304,7 +309,12 @@ end
 
 local function nodeEligible(model)
 	local nt = model:GetAttribute("NodeType")
-	if not (nt and FarmTypes[nt]) then return false end
+	if not nt then return false end
+	if farmOnly then
+		if nt ~= farmOnly then return false end
+	elseif not FarmTypes[nt] then
+		return false
+	end
 	local b = nodeBench[model]
 	if b and os.clock() < b then return false end
 	local slot = slotForNode(model)
@@ -1009,7 +1019,10 @@ local function tripWanted()
 	return ore >= Values.TripOre or (arrowsShort and have("Arrow") < Values.ArrowTarget / 3)
 end
 
-local function runTrip()
+-- opts.smelt: queue ore at the furnaces; opts.arrowCrafts: Arrow crafts to queue (nil = top up to ArrowTarget)
+local arrowsDueUntil = 0 -- queued arrows are still arriving until this time
+local function runTrip(opts)
+	opts = opts or { smelt = true }
 	tripping = true
 	tripStats.last = "going"
 	local ok = pcall(function()
@@ -1031,7 +1044,7 @@ local function runTrip()
 		-- ores: split each kind evenly over the furnaces, from one inventory snapshot
 		-- (the server's inventory update lags the request, so re-reading mid-loop over-asks)
 		local jobs = { { "IronOre", "IronIngot", have("IronOre") }, { "GoldOre", "GoldIngot", have("GoldOre") } }
-		for i, f in ipairs(furnaces) do
+		for i, f in ipairs(opts.smelt and furnaces or {}) do
 			stepTo(f)
 			local key = f:GetAttribute("CellKey")
 			if State.AutoFuel then fuelFurnace(key) end
@@ -1049,14 +1062,15 @@ local function runTrip()
 
 		-- arrows: 2 Wood -> 4 Arrows per craft
 		local smith = smiths[1]
-		if smith and have("Arrow") < Values.ArrowTarget then
+		if smith and (opts.arrowCrafts or have("Arrow") < Values.ArrowTarget) then
 			local byWood = math.floor((have("Wood") - Values.KeepWood) / 2)
-			local byNeed = math.ceil((Values.ArrowTarget - have("Arrow")) / 4)
+			local byNeed = opts.arrowCrafts or math.ceil((Values.ArrowTarget - have("Arrow")) / 4)
 			local n = math.min(QUEUE_MAX, byWood, byNeed)
 			if n > 0 then
 				stepTo(smith)
 				RequestCraft:FireServer(smith:GetAttribute("CellKey"), "Arrow", n)
 				tripStats.arrows += n * 4
+				arrowsDueUntil = os.clock() + n * 3 * 1.1 + 5 -- 3s per craft at the Toolsmith
 				task.wait(0.4)
 			end
 		end
@@ -1078,9 +1092,63 @@ task.spawn(function()
 			local hrp = getHRP()
 			-- leave between nodes, never mid-node
 			local busy = (State.Farm or State.Travel) and farmHasNode(hrp)
-			if not busy and nearHub() and tripWanted() then runTrip() end
+			if not busy and nearHub() and tripWanted() then runTrip({ smelt = true }) end
 		end
 		task.wait(2)
+	end
+end)
+
+
+-- Slime: bow the slimes (Blink + Magic) forever; craft arrows when low, farm trees when wood runs out
+local slimeStats = { phase = "off", arrowTrips = 0, woodRuns = 0 }
+local slimeSaved -- toggles to restore when Slime is switched off
+
+local function slimeSet(bow, farm)
+	if State.Bow ~= bow then setFeature("Bow", bow) end
+	if State.Farm ~= farm then setFeature("Farm", farm) end
+	if State.Travel ~= farm then setFeature("Travel", farm) end
+end
+
+task.spawn(function()
+	while alive do
+		if State.Slime and not tripping then
+			if not slimeSaved then
+				slimeSaved = { Bow = State.Bow, Farm = State.Farm, Travel = State.Travel, Magic = State.Magic, Blink = State.Blink }
+				State.Magic, State.Blink = true, true
+				slimeStats.phase = "slime"
+			end
+			local known = next(inv) ~= nil -- counts arrive with the first inventory change
+			if slimeStats.phase == "slime" then
+				slimeSet(true, false)
+				if known and have("Wood") < Values.WoodLow then
+					slimeStats.phase = "wood"; slimeStats.woodRuns += 1
+				elseif known and have("Arrow") < Values.ArrowLow and os.clock() > arrowsDueUntil and nearHub() then
+					if have("Wood") - Values.KeepWood >= 2 then
+						slimeSet(false, false)
+						task.wait(1.5) -- let a blink hop finish before walking off
+						runTrip({ smelt = State.AutoSmelt, arrowCrafts = QUEUE_MAX })
+						slimeStats.arrowTrips += 1
+					else
+						slimeStats.phase = "wood"; slimeStats.woodRuns += 1
+					end
+				end
+			elseif slimeStats.phase == "wood" then
+				farmOnly = "Tree"
+				slimeSet(false, true)
+				if known and have("Wood") >= Values.WoodTarget then
+					farmOnly = nil
+					slimeStats.phase = "slime"
+				end
+			end
+		elseif not State.Slime and slimeSaved then
+			farmOnly = nil
+			slimeSet(slimeSaved.Bow, slimeSaved.Farm)
+			if State.Travel ~= slimeSaved.Travel then setFeature("Travel", slimeSaved.Travel) end
+			State.Magic, State.Blink = slimeSaved.Magic, slimeSaved.Blink
+			slimeSaved = nil
+			slimeStats.phase = "off"
+		end
+		task.wait(1)
 	end
 end)
 
@@ -1202,7 +1270,7 @@ end))
 --------------------------------------------------------------------
 local Features -- forward
 
-local function setFeature(name, on)
+setFeature = function(name, on)
 	State[name] = on
 	if name == "Bow" then
 		if on then task.spawn(bowLoop) end
@@ -1558,6 +1626,12 @@ slider("Blink range", "BlinkRange", 20, 300, " studs")
 slider("Blink depth (0 = above ground)", "BlinkDepth", 0, 15, " studs")
 slider("Bow draw (low = fast, high = damage)", "Draw", 12, 100, "%")
 
+section("Slime")
+featureRow("Slime", "Slime farm (bow, arrows, wood, repeat)")
+slider("Craft arrows under", "ArrowLow", 10, 400, "")
+slider("Farm wood under", "WoodLow", 0, 3000, "")
+slider("Farm wood up to", "WoodTarget", 500, 20000, "")
+
 section("Factory")
 featureRow("AutoFuel",  "Auto fuel furnaces (from anywhere)")
 featureRow("AutoSmelt", "Auto smelt + arrows (island trips)")
@@ -1643,7 +1717,7 @@ env.AboveAutohit = {
 	Debug = function()
 		return { slot = curSlot, items = slotItem, cooldowns = slotCooldown, target = farmTarget,
 			nodes = #nodes, enemies = #enemies, traveling = traveling, quick = quickStats,
-			tripping = tripping, trip = tripStats, machines = Machines, inv = inv,
+			tripping = tripping, trip = tripStats, slime = slimeStats, farmOnly = farmOnly, machines = Machines, inv = inv,
 			bowTarget = velTarget, bowVel = velEst }
 	end,
 	Unload = function()
