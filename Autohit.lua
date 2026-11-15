@@ -49,6 +49,7 @@ local Values = {
 	Draw     = 12,    -- bow draw %, 12 = max fire rate, 100 = max damage
 	Reach    = 12,    -- melee reach in studs
 	BlinkRange = 150, -- how far Blink Shot will hop for a target
+	BlinkDepth = 8,   -- studs under the slime to shoot from (0 = beside it, visible)
 }
 
 local Binds = {
@@ -103,7 +104,19 @@ end
 local function targetAlive(inst)
 	if not inst.Parent then return false end
 	local hum = inst:FindFirstChildOfClass("Humanoid")
-	return not (hum and hum.Health <= 0)
+	if hum and hum.Health <= 0 then return false end
+	-- Empty guardian spawn slots keep their EnemyId but the slime art is fully transparent.
+	-- Those were the "teleports to nothing".
+	if inst:GetAttribute("EnemyId") then
+		local art = inst:FindFirstChildWhichIsA("Model")
+		if art then
+			for _, p in ipairs(art:GetDescendants()) do
+				if p:IsA("BasePart") and p.Transparency < 1 then return true end
+			end
+			return false
+		end
+	end
+	return true
 end
 
 local nodes, enemies, lastScan = {}, {}, 0
@@ -237,6 +250,22 @@ local function setAim(on)
 	if RequestSprint then pcall(function() RequestSprint:FireServer(on, "Aim") end) end
 end
 
+local lockedTarget
+
+-- noclip for the blink: drop collision on the rig, restore it exactly afterwards
+local function setNoclip(char, on, saved)
+	for _, p in ipairs(char:GetDescendants()) do
+		if p:IsA("BasePart") then
+			if on then
+				if saved[p] == nil then saved[p] = p.CanCollide end
+				p.CanCollide = false
+			elseif saved[p] ~= nil then
+				p.CanCollide = saved[p]
+			end
+		end
+	end
+end
+
 local bowRunning = false
 local function bowLoop()
 	if bowRunning then return end
@@ -249,14 +278,20 @@ local function bowLoop()
 		local target
 		if hrp and State.Magic then
 			if State.Blink then
-				-- blink ignores walls: we fire from right above the target
-				local bestD = Values.BlinkRange
-				for _, inst in ipairs(enemies) do
-					local p = targetAlive(inst) and hitPart(inst)
-					if p and not isImmune(p) then
-						local d = (p.Position - hrp.Position).Magnitude
-						if d < bestD then target, bestD = p, d end
+				-- stick to one slime until it dies, goes dormant, or turns out immune
+				if lockedTarget and targetAlive(lockedTarget) and not isImmune(lockedTarget) then
+					target = lockedTarget
+				else
+					-- blink ignores walls: we fire from right under the target
+					local bestD = Values.BlinkRange
+					for _, inst in ipairs(enemies) do
+						local p = targetAlive(inst) and hitPart(inst)
+						if p and not isImmune(p) then
+							local d = (p.Position - hrp.Position).Magnitude
+							if d < bestD then target, bestD = p, d end
+						end
 					end
+					lockedTarget = target
 				end
 			else
 				target = nearestVisibleEnemy(shotOrigin(hrp), 300)
@@ -274,13 +309,19 @@ local function bowLoop()
 			if proj then
 				-- Blink: hop next to the target so the server sees us there, shoot, hop back
 				local home
+				local collide = {}
 				if target and State.Blink then
 					home = hrp.CFrame
-					-- Hold the spot for a moment. A single CFrame set gets interpolated server-side,
+					-- Stand BlinkDepth studs under the slime (0 = beside it, above ground), noclipped.
+					-- Hold the spot for a moment: a single CFrame set gets interpolated server-side,
 					-- so the shot is either rejected or fired from somewhere mid-path.
-					local stand = CFrame.new(target.Position + Vector3.new(0, 6, 6), target.Position)
+					local stand = Values.BlinkDepth > 0
+						and CFrame.new(target.Position - Vector3.new(0, Values.BlinkDepth, 0))
+						or CFrame.new(target.Position + Vector3.new(0, 6, 6), target.Position)
+					local char = getChar()
 					local t0 = os.clock()
 					while os.clock() - t0 < BLINK_DWELL do
+						if char then setNoclip(char, true, collide) end
 						hrp.CFrame = stand
 						hrp.AssemblyLinearVelocity = Vector3.zero
 						RunService.Heartbeat:Wait()
@@ -306,6 +347,8 @@ local function bowLoop()
 					task.wait(0.15)
 					local r = getHRP()
 					if r then r.CFrame = home; r.AssemblyLinearVelocity = Vector3.zero end
+					local char = getChar()
+					if char then setNoclip(char, false, collide) end
 				end
 				if target then
 					local before = healthOf(target)
@@ -711,6 +754,7 @@ featureRow("Bow",   "Auto Bow")
 featureRow("Magic", "Magic Aim")
 featureRow("Blink", "Blink Shot")
 slider("Blink range", "BlinkRange", 20, 300, " studs")
+slider("Blink depth (0 = above ground)", "BlinkDepth", 0, 15, " studs")
 slider("Bow draw (low = fast, high = damage)", "Draw", 12, 100, "%")
 
 section("Movement")
