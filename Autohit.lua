@@ -6,7 +6,7 @@
   Unload: getgenv().AboveAutohit.Unload()
 ]]
 
-local VERSION = "3.4"
+local VERSION = "3.5"
 
 local Players    = game:GetService("Players")
 local RS         = game:GetService("ReplicatedStorage")
@@ -45,6 +45,7 @@ local CONFIG_FILE = "AboveHub.json"
 local State = {
 	Farm = false, Travel = false, Fight = false, Bow = false, Magic = true, Blink = false,
 	Speed = false, Jump = false, Fly = false, FlyNoclip = true, QuickShot = false,
+	AutoFuel = false, AutoSmelt = false,
 }
 
 local Values = {
@@ -61,11 +62,15 @@ local Values = {
 	BowRange = 300,   -- Auto Bow target range without Blink
 	BowLead = 100,    -- % of measured target velocity to lead by (0 = aim at body)
 	QuickHold = 36,   -- hundredths of a second Farm waits after a quick shot before swinging again
+	TripOre = 60,     -- Auto smelt: go to the island once you carry this much Iron + Gold ore
+	ArrowTarget = 150,-- Auto smelt: craft arrows on a trip while you have fewer than this
+	KeepWood = 50,    -- Auto smelt: wood never spent on arrows
+	KeepCoal = 0,     -- Auto fuel: coal kept in the inventory
 }
 
 local Binds = {
 	Menu = "RightShift", Farm = "H", Travel = "G", Fight = "J", Bow = "B", Magic = "N", Blink = "V",
-	Speed = "U", Jump = "K", Fly = "F", FlyNoclip = "", QuickShot = "",
+	Speed = "U", Jump = "K", Fly = "F", FlyNoclip = "", QuickShot = "", AutoFuel = "", AutoSmelt = "",
 }
 
 -- Which enemy kinds Auto Bow shoots (EnemyId -> bool). Filled from EnemyConfig later.
@@ -88,10 +93,13 @@ local NODE_RULES = {
 if TCFG and type(TCFG.Nodes) == "table" then NODE_RULES = TCFG.Nodes end
 for nt in pairs(NODE_RULES) do FarmTypes[nt] = true end
 
+-- island machines by kind: { Furnace = { cellKey, ... }, Toolsmith = { ... } }; learned on island visits
+local Machines = { Furnace = {}, Toolsmith = {} }
+
 local function saveConfig()
 	if not writefile then return end
 	pcall(function()
-		writefile(CONFIG_FILE, Http:JSONEncode({ Binds = Binds, Values = Values, FarmTypes = FarmTypes, ShootTypes = ShootTypes }))
+		writefile(CONFIG_FILE, Http:JSONEncode({ Binds = Binds, Values = Values, FarmTypes = FarmTypes, ShootTypes = ShootTypes, Machines = Machines }))
 	end)
 end
 
@@ -101,7 +109,12 @@ local function loadConfig()
 		if not isfile(CONFIG_FILE) then return end
 		local data = Http:JSONDecode(readfile(CONFIG_FILE))
 		for k, v in pairs(data.Binds or {}) do if Binds[k] ~= nil then Binds[k] = v end end
-		for k, v in pairs(data.Values or {}) do if type(v) == "number" and Values[k] then Values[k] = v end end
+		for k, v in pairs(data.Values or {}) do if type(v) == "number" and Values[k] ~= nil then Values[k] = v end end
+		for kind, keys in pairs(data.Machines or {}) do
+			if Machines[kind] and type(keys) == "table" then
+				for _, key in ipairs(keys) do if type(key) == "string" then table.insert(Machines[kind], key) end end
+			end
+		end
 		for k, v in pairs(data.FarmTypes or {}) do if FarmTypes[k] ~= nil and type(v) == "boolean" then FarmTypes[k] = v end end
 		for k, v in pairs(data.ShootTypes or {}) do if type(v) == "boolean" then ShootTypes[k] = v end end
 	end)
@@ -473,6 +486,7 @@ end
 
 local bowBusy = false -- true while the bow holds the tool, so melee and travel wait
 local traveling = false -- Farm Travel is mid-trip (set in travelTo below)
+local tripping = false  -- Auto smelt is away on the island; everything else idles
 
 -- Shared tool lock between Bow and Farm. Without it they re-equip over each other
 -- every bow cycle and Farm loses about half its swings.
@@ -488,7 +502,7 @@ local bowTurnShots = 0
 local quickTarget -- set by bowLoop, consumed by the scheduler
 local quickStats = { offered = 0, fired = 0, noTarget = 0, noProj = 0, noDir = 0, expired = 0 }
 local function quickReady(hrp, target)
-	return State.QuickShot and target ~= nil and not traveling
+	return State.QuickShot and target ~= nil and not traveling and not tripping
 		and (State.Farm or State.Travel) and farmHasNode(hrp)
 		and projectileFor(slotItem.Weapon) ~= nil
 end
@@ -498,6 +512,7 @@ local function farmHasNode(hrp)
 end
 
 local function bowShouldYield(hrp, target)
+	if tripping then return true end
 	if not (hrp and (State.Farm or State.Travel)) then return false end
 	if traveling then return true end
 	if target and isBossType(enemyKind(enemyOf(target))) then return false end
@@ -713,7 +728,7 @@ end
 track(RunService.Heartbeat:Connect(function()
 	if not alive then return end
 	if os.clock() - lastScan > FULL_RESCAN then rescan() else rebuildLists() end
-	if not (State.Farm or State.Travel or State.Fight) then return end
+	if not (State.Farm or State.Travel or State.Fight) or tripping then return end
 	local hrp = getHRP()
 	if not hrp then return end
 
@@ -846,7 +861,7 @@ local function travelLoop()
 	blockSeats(true)
 	while alive and State.Travel do
 		local hrp = getHRP()
-		if not hrp or bowBusy then
+		if not hrp or bowBusy or tripping then
 			task.wait(0.25)
 		else
 			local here = nearestIn(nodes, hrp.Position, Values.Reach, nodeEligible)
@@ -868,6 +883,204 @@ local function travelLoop()
 	blockSeats(false)
 	travelRunning = false
 end
+
+--------------------------------------------------------------------
+-- Factory: Auto fuel (works from anywhere) + Auto smelt (island trips)
+-- Server rules found in testing:
+--   * RequestLoadFuel(cellKey, coal) has no range check; 1 Coal = 8 smelts, cap 200.
+--   * RequestCraft(cellKey, recipe, count) needs you within ~20 studs ("Too far").
+--   * Queued jobs keep running while you're away and the output goes to the inventory.
+--------------------------------------------------------------------
+local RequestLoadFuel = Remotes:FindFirstChild("RequestLoadFuel")
+local RequestCraft    = Remotes:FindFirstChild("RequestCraft")
+local InventoryChanged = Remotes:FindFirstChild("InventoryChanged")
+local AlertRemote     = Remotes:FindFirstChild("Alert")
+
+local FUEL_CAP, SMELTS_PER_COAL, QUEUE_MAX = 200, 8, 100
+pcall(function()
+	local FC = require(RS.Shared.Config).Factory.Fuel
+	FUEL_CAP = FC.MaxStoredCrafts or FUEL_CAP
+	SMELTS_PER_COAL = (FC.CraftsPerUnit and FC.CraftsPerUnit.Furnace) or SMELTS_PER_COAL
+end)
+pcall(function() QUEUE_MAX = require(RS.Shared.Config).Recipe.QueueMax or QUEUE_MAX end)
+
+local inv = {} -- itemId -> count, from the server's InventoryChanged
+if InventoryChanged then
+	track(InventoryChanged.OnClientEvent:Connect(function(counts)
+		if type(counts) == "table" then inv = counts end
+	end))
+end
+local function have(id) return tonumber(inv[id]) or 0 end
+
+-- the last "Fueled: N crafts" alert, so a 1-coal probe tells us how full a furnace is
+local lastFueled, lastFueledAt = nil, 0
+if AlertRemote then
+	track(AlertRemote.OnClientEvent:Connect(function(msg)
+		local n = type(msg) == "string" and tonumber(msg:match("^Fueled: (%d+)"))
+		if n then lastFueled, lastFueledAt = n, os.clock() end
+	end))
+end
+
+local function rememberMachine(kind, key)
+	local list = Machines[kind]
+	if not list then return end
+	for _, k in ipairs(list) do if k == key then return end end
+	table.insert(list, key)
+	saveConfig()
+end
+
+-- top one furnace up: probe with 1 coal, read back how full it is, add the rest
+local function fuelFurnace(key)
+	if have("Coal") - Values.KeepCoal < 1 then return end
+	local sent = os.clock()
+	RequestLoadFuel:FireServer(key, 1)
+	local t0 = os.clock()
+	while lastFueledAt < sent and os.clock() - t0 < 2 do task.wait(0.1) end
+	if lastFueledAt < sent then return end -- no reply: wrong key or not our furnace
+	local need = math.floor((FUEL_CAP - lastFueled) / SMELTS_PER_COAL)
+	need = math.min(need, have("Coal") - Values.KeepCoal - 1)
+	if need > 0 then RequestLoadFuel:FireServer(key, need) end
+end
+
+task.spawn(function()
+	while alive do
+		if State.AutoFuel and RequestLoadFuel and not tripping then
+			for _, key in ipairs(Machines.Furnace) do
+				if not (alive and State.AutoFuel) then break end
+				fuelFurnace(key)
+				task.wait(0.5)
+			end
+		end
+		task.wait(30)
+	end
+end)
+
+-- Auto smelt -----------------------------------------------------------
+local function islandModel()
+	for _, m in ipairs(workspace:GetChildren()) do
+		if m.Name:match("^Island_" .. lp.UserId .. ":") then return m end
+	end
+end
+
+-- walk (not teleport) through a portal's TouchPart; the server only fires on a real walk-in
+local function walkThrough(touch, arrivedCheck)
+	local hrp, hum = getHRP(), getHum()
+	if not (hrp and hum and touch) then return false end
+	local look = touch.CFrame.LookVector
+	for _, side in ipairs({ 1, -1 }) do
+		hrp.CFrame = CFrame.new(touch.Position + look * 10 * side + Vector3.new(0, 1, 0))
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		task.wait(0.8)
+		hum:MoveTo(touch.Position - look * 8 * side)
+		local t0 = os.clock()
+		while os.clock() - t0 < 5 do
+			task.wait(0.15)
+			if arrivedCheck() then return true end
+		end
+	end
+	return false
+end
+
+local function nearIsland()
+	local m, hrp = islandModel(), getHRP()
+	return m and hrp and (m:GetPivot().Position - hrp.Position).Magnitude < 300
+end
+local function nearHub()
+	local hub, hrp = workspace:FindFirstChild("Hub"), getHRP()
+	return hub and hrp and (hub:GetPivot().Position - hrp.Position).Magnitude < 400
+end
+
+local function stepTo(part)
+	local hrp = getHRP()
+	if not hrp then return end
+	local flat = (hrp.Position - part.Position) * Vector3.new(1, 0, 1)
+	flat = flat.Magnitude > 0.1 and flat.Unit or Vector3.xAxis
+	hrp.CFrame = CFrame.new(part.Position + flat * 6 + Vector3.new(0, 3, 0), part.Position)
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	task.wait(0.5) -- let the server see us there before asking
+end
+
+local tripStats = { trips = 0, smelts = 0, arrows = 0, last = "" }
+
+local function tripWanted()
+	local ore = have("IronOre") + have("GoldOre")
+	local arrowsShort = have("Arrow") < Values.ArrowTarget and have("Wood") - Values.KeepWood >= 2
+	-- ore is the main trigger; low arrows alone only send you once they're under a third of the target
+	return ore >= Values.TripOre or (arrowsShort and have("Arrow") < Values.ArrowTarget / 3)
+end
+
+local function runTrip()
+	tripping = true
+	tripStats.last = "going"
+	local ok = pcall(function()
+		local hubPortal = workspace:FindFirstChild("Hub") and workspace.Hub:FindFirstChild("HOME")
+		hubPortal = hubPortal and hubPortal:FindFirstChild("TouchPart")
+		if not walkThrough(hubPortal, nearIsland) then tripStats.last = "portal to island failed" return end
+		task.wait(1.5) -- let the island stream in
+
+		local island = islandModel()
+		local furnaces, smiths = {}, {}
+		for _, d in ipairs(island:GetDescendants()) do
+			if d:IsA("BasePart") and d:GetAttribute("CellKey") then
+				local id = d:GetAttribute("MachineId")
+				if id == "Furnace" then table.insert(furnaces, d); rememberMachine("Furnace", d:GetAttribute("CellKey")) end
+				if id == "Toolsmith" then table.insert(smiths, d); rememberMachine("Toolsmith", d:GetAttribute("CellKey")) end
+			end
+		end
+
+		-- ores: split each kind over the furnaces, QUEUE_MAX per request
+		local jobs = { { "IronOre", "IronIngot" }, { "GoldOre", "GoldIngot" } }
+		for i, f in ipairs(furnaces) do
+			stepTo(f)
+			local key = f:GetAttribute("CellKey")
+			if State.AutoFuel then fuelFurnace(key) end
+			for _, job in ipairs(jobs) do
+				local left = #furnaces - i + 1
+				local n = math.min(QUEUE_MAX, math.ceil(have(job[1]) / left))
+				if n > 0 then
+					RequestCraft:FireServer(key, job[2], n)
+					tripStats.smelts += n
+					task.wait(0.4)
+				end
+			end
+		end
+
+		-- arrows: 2 Wood -> 4 Arrows per craft
+		local smith = smiths[1]
+		if smith and have("Arrow") < Values.ArrowTarget then
+			local byWood = math.floor((have("Wood") - Values.KeepWood) / 2)
+			local byNeed = math.ceil((Values.ArrowTarget - have("Arrow")) / 4)
+			local n = math.min(QUEUE_MAX, byWood, byNeed)
+			if n > 0 then
+				stepTo(smith)
+				RequestCraft:FireServer(smith:GetAttribute("CellKey"), "Arrow", n)
+				tripStats.arrows += n * 4
+				task.wait(0.4)
+			end
+		end
+
+		local back = island:FindFirstChild("HUB")
+		back = back and back:FindFirstChild("TouchPart")
+		if not walkThrough(back, nearHub) then tripStats.last = "portal back failed" return end
+		tripStats.trips += 1
+		tripStats.last = "ok"
+	end)
+	if not ok then tripStats.last = "error" end
+	task.wait(1)
+	tripping = false
+end
+
+task.spawn(function()
+	while alive do
+		if State.AutoSmelt and RequestCraft and not tripping and not traveling and getHRP() then
+			local hrp = getHRP()
+			-- leave between nodes, never mid-node
+			local busy = (State.Farm or State.Travel) and farmHasNode(hrp)
+			if not busy and nearHub() and tripWanted() then runTrip() end
+		end
+		task.wait(2)
+	end
+end)
 
 --------------------------------------------------------------------
 -- Speed / Jump — polled, so the game's sprint script can't storm a listener
@@ -1343,6 +1556,14 @@ slider("Blink range", "BlinkRange", 20, 300, " studs")
 slider("Blink depth (0 = above ground)", "BlinkDepth", 0, 15, " studs")
 slider("Bow draw (low = fast, high = damage)", "Draw", 12, 100, "%")
 
+section("Factory")
+featureRow("AutoFuel",  "Auto fuel furnaces (from anywhere)")
+featureRow("AutoSmelt", "Auto smelt + arrows (island trips)")
+slider("Trip at ore (Iron + Gold)", "TripOre", 10, 300, "")
+slider("Keep arrows at", "ArrowTarget", 0, 600, "")
+slider("Keep wood", "KeepWood", 0, 500, "")
+slider("Keep coal", "KeepCoal", 0, 200, "")
+
 section("Movement")
 featureRow("Speed", "Speed")
 slider("WalkSpeed", "Speed", 16, 150)
@@ -1420,6 +1641,7 @@ env.AboveAutohit = {
 	Debug = function()
 		return { slot = curSlot, items = slotItem, cooldowns = slotCooldown, target = farmTarget,
 			nodes = #nodes, enemies = #enemies, traveling = traveling, quick = quickStats,
+			tripping = tripping, trip = tripStats, machines = Machines, inv = inv,
 			bowTarget = velTarget, bowVel = velEst }
 	end,
 	Unload = function()
