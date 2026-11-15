@@ -44,7 +44,7 @@ local CONFIG_FILE = "AboveHub.json"
 
 local State = {
 	Farm = false, Travel = false, Fight = false, Bow = false, Magic = true, Blink = false,
-	Speed = false, Jump = false, Fly = false,
+	Speed = false, Jump = false, Fly = false, FlyNoclip = true,
 }
 
 local Values = {
@@ -64,7 +64,7 @@ local Values = {
 
 local Binds = {
 	Menu = "RightShift", Farm = "H", Travel = "G", Fight = "J", Bow = "B", Magic = "N", Blink = "V",
-	Speed = "U", Jump = "K", Fly = "F",
+	Speed = "U", Jump = "K", Fly = "F", FlyNoclip = "",
 }
 
 -- Which enemy kinds Auto Bow shoots (EnemyId -> bool). Filled from EnemyConfig later.
@@ -778,11 +778,35 @@ local function resetJump() local h = getHum(); if h then pcall(function() h.Jump
 -- Fly — LinearVelocity + AlignOrientation on the root, camera-relative
 --------------------------------------------------------------------
 local flyParts
+local flyCollide = {} -- part -> original CanCollide while fly noclip is active
+
+local function restoreFlyCollide()
+	for p, v in pairs(flyCollide) do if p.Parent then p.CanCollide = v end end
+	table.clear(flyCollide)
+end
+
+-- Stepped runs before physics, so the Humanoid can't re-enable collision in between
+track(RunService.Stepped:Connect(function()
+	if not (State.Fly and State.FlyNoclip and flyParts) then
+		if next(flyCollide) then restoreFlyCollide() end
+		return
+	end
+	local char = getChar()
+	if not char then return end
+	for _, p in ipairs(char:GetDescendants()) do
+		if p:IsA("BasePart") then
+			if flyCollide[p] == nil then flyCollide[p] = p.CanCollide end
+			p.CanCollide = false
+		end
+	end
+end))
+
 local function stopFly()
 	if flyParts then
 		for _, p in ipairs(flyParts) do pcall(function() p:Destroy() end) end
 		flyParts = nil
 	end
+	restoreFlyCollide()
 	local hum = getHum()
 	if hum then hum.PlatformStand = false; hum:ChangeState(Enum.HumanoidStateType.Freefall) end
 end
@@ -1181,6 +1205,7 @@ slider("WalkSpeed", "Speed", 16, 150)
 featureRow("Jump",  "Jump")
 slider("JumpPower", "Jump", 50, 300)
 featureRow("Fly",   "Fly  (Space / Ctrl)")
+featureRow("FlyNoclip", "Fly noclip")
 slider("Fly speed", "FlySpeed", 10, 250)
 
 section("Menu")
