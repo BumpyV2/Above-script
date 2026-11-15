@@ -215,6 +215,36 @@ local function nearestVisibleEnemy(origin, range)
 	return best
 end
 
+-- Slimes are CFrame-driven (no physics velocity), so estimate it from position deltas.
+local vel = setmetatable({}, { __mode = "k" })
+local lastPos = setmetatable({}, { __mode = "k" })
+track(RunService.Heartbeat:Connect(function(dt)
+	if not State.Bow or dt <= 0 then return end
+	for _, inst in ipairs(enemies) do
+		local p = inst.Parent and hitPart(inst)
+		if p then
+			local pos = p.Position
+			local prev = lastPos[p]
+			if prev then
+				local v = (pos - prev) / dt
+				-- smooth so a single hop frame doesn't fling the aim point
+				vel[p] = vel[p] and vel[p]:Lerp(v, 0.35) or v
+			end
+			lastPos[p] = pos
+		end
+	end
+end))
+
+local function leadPoint(origin, part, speed)
+	local v = vel[part] or Vector3.zero
+	local aim = part.Position
+	for _ = 1, 3 do
+		local t = (aim - origin).Magnitude / math.max(speed, 1)
+		aim = part.Position + v * t
+	end
+	return aim
+end
+
 local bowBusy = false -- true while the bow has a target, so melee does not steal the equip
 local function setAim(on)
 	if RequestSprint then pcall(function() RequestSprint:FireServer(on, "Aim") end) end
@@ -244,14 +274,17 @@ local function bowLoop()
 			local proj = heldProjectile()
 			if proj then
 				local origin = shotOrigin(hrp)
+				local aimPos
 				if target then
 					-- server accepts a launch point up to ShotOriginSlackStuds (12) from the bow:
 					-- spawn the arrow as close to the target as that allows
 					local rel = target.Position - origin
 					local push = math.min(rel.Magnitude - 1.5, SHOT_SLACK)
 					if push > 0 then origin += rel.Unit * push end
+					local okS, speed = pcall(WCFG.launchSpeed, proj, draw)
+					aimPos = leadPoint(origin, target, okS and speed or 100)
 				end
-				local dir = target and aimAt(origin, target.Position, proj, draw)
+				local dir = aimPos and aimAt(origin, aimPos, proj, draw)
 					or (workspace.CurrentCamera and workspace.CurrentCamera.CFrame.LookVector)
 				if dir then
 					shotId += 1
