@@ -6,7 +6,7 @@
   Unload: getgenv().AboveAutohit.Unload()
 ]]
 
-local VERSION = "3.1"
+local VERSION = "3.2"
 
 local Players    = game:GetService("Players")
 local RS         = game:GetService("ReplicatedStorage")
@@ -31,7 +31,8 @@ local RequestSprint = Remotes:FindFirstChild("RequestSprint")
 local EquippedChanged = Remotes:FindFirstChild("EquippedChanged")
 local HitConfirmed    = Remotes:FindFirstChild("HitConfirmed")
 
-local BAL, WCFG, TCFG
+local BAL, WCFG, TCFG, ECFG
+pcall(function() ECFG = require(RS.Shared.Config.EnemyConfig) end)
 pcall(function() BAL  = require(RS.Shared.Ballistics) end)
 pcall(function() WCFG = require(RS.Shared.Config.WeaponConfig) end)
 pcall(function() TCFG = require(RS.Shared.Config.ToolConfig) end)
@@ -57,12 +58,20 @@ local Values = {
 	SwingEarly = 10,  -- hundredths of a second to swing before the tool's cooldown (server slack 0.15)
 	TravelSpeed = 40, -- studs/s for Farm Travel (40 tested clean)
 	TravelRange = 400,-- how far Farm Travel will go for a node
+	BowRange = 300,   -- Auto Bow target range without Blink
 }
 
 local Binds = {
 	Menu = "RightShift", Farm = "H", Travel = "G", Fight = "J", Bow = "B", Magic = "N", Blink = "V",
 	Speed = "U", Jump = "K", Fly = "F",
 }
+
+-- Which enemy kinds Auto Bow shoots (EnemyId -> bool). Filled from EnemyConfig later.
+local ShootTypes = {
+	GreenSlime = true, BlueSlime = true, PinkSlime = true, OrangeSlime = true, KingSlime = true,
+	Skeleton = true, SkeletonArcher = true, SkeletonKnight = true, Morten = true,
+}
+local BOSS_IDS = { Morten = true, KingSlime = true }
 
 -- Which node types Farm will hit / travel to. Filled from ToolConfig.Nodes below.
 local FarmTypes = {}
@@ -80,7 +89,7 @@ for nt in pairs(NODE_RULES) do FarmTypes[nt] = true end
 local function saveConfig()
 	if not writefile then return end
 	pcall(function()
-		writefile(CONFIG_FILE, Http:JSONEncode({ Binds = Binds, Values = Values, FarmTypes = FarmTypes }))
+		writefile(CONFIG_FILE, Http:JSONEncode({ Binds = Binds, Values = Values, FarmTypes = FarmTypes, ShootTypes = ShootTypes }))
 	end)
 end
 
@@ -92,6 +101,7 @@ local function loadConfig()
 		for k, v in pairs(data.Binds or {}) do if Binds[k] ~= nil then Binds[k] = v end end
 		for k, v in pairs(data.Values or {}) do if type(v) == "number" and Values[k] then Values[k] = v end end
 		for k, v in pairs(data.FarmTypes or {}) do if FarmTypes[k] ~= nil and type(v) == "boolean" then FarmTypes[k] = v end end
+		for k, v in pairs(data.ShootTypes or {}) do if type(v) == "boolean" then ShootTypes[k] = v end end
 	end)
 end
 loadConfig()
@@ -344,29 +354,117 @@ local function isImmune(part)
 	return t and os.clock() < t
 end
 
+-- Which enemy kinds the bow shoots. Bosses are shot first whenever one is in range.
+local isBossType = function(id) return id == "Morten" or id == "KingSlime" end
+if ECFG and type(ECFG.Enemies) == "table" then
+	for id, cfg in pairs(ECFG.Enemies) do
+		if ShootTypes[id] == nil then ShootTypes[id] = true end
+		if type(cfg) == "table" and (cfg.behavior == "Boss" or (cfg.scale or 1) >= 4) then BOSS_IDS[id] = true end
+	end
+	isBossType = function(id) return BOSS_IDS[id] == true end
+end
+
+local function enemyKind(inst)
+	return inst and inst:GetAttribute("EnemyId")
+end
+
+-- the instance carrying EnemyId for a hit part (slimes keep it on the parent model)
+local function enemyOf(part)
+	local x = part
+	while x and x ~= workspace do
+		if x:GetAttribute("EnemyId") then return x end
+		x = x.Parent
+	end
+	return part
+end
+
+local function shootable(inst)
+	local id = enemyKind(inst)
+	-- unknown ids (new mobs the config didn't list) are shot unless switched off
+	return id ~= nil and ShootTypes[id] ~= false
+end
+
+-- Rigged enemies (skeletons, Morten) and bosses are never "immune": a health bar that
+-- didn't move after a shot on those is a miss, not a dead spawn slot.
+local function immunityApplies(inst)
+	return not (inst:GetAttribute("Rigged") or inst:GetAttribute("Boss"))
+end
+
 -- nearest enemy the arrow can actually reach: a blocked line just buries the arrow in a ledge
 local losParams = RaycastParams.new()
 losParams.FilterType = Enum.RaycastFilterType.Exclude
-local function nearestVisibleEnemy(origin, range)
+local function losClear(origin, p, inst)
+	local hit = workspace:Raycast(origin, p.Position - origin, losParams)
+	if not hit then return true end
+	local h = hit.Instance
+	if h == p or h:IsDescendantOf(inst) then return true end
+	-- the visible skeleton/boss rig lives under EnemyViews; hitting any enemy is fine
+	local ev = workspace:FindFirstChild("EnemyViews")
+	if ev and h:IsDescendantOf(ev) then return true end
+	return enemySet[h] == true
+end
+
+local function pickBowTarget(origin, range, needLos)
 	local c = getChar()
 	losParams.FilterDescendantsInstances = c and { c } or {}
-	local best, bestD = nil, range
+	local best, bestD, bestBoss = nil, range, false
 	for _, inst in ipairs(enemies) do
-		if targetAlive(inst) then
+		if shootable(inst) and targetAlive(inst) then
 			local p = hitPart(inst)
 			if p and not isImmune(p) then
-				local rel = p.Position - origin
-				local d = rel.Magnitude
-				if d < bestD then
-					local hit = workspace:Raycast(origin, rel, losParams)
-					if not hit or hit.Instance == p or hit.Instance:IsDescendantOf(inst) then
-						best, bestD = p, d
-					end
+				local d = (p.Position - origin).Magnitude
+				local boss = isBossType(enemyKind(inst))
+				-- a boss in range beats any mob; among equals, nearest wins
+				local better = (boss and not bestBoss) or (boss == bestBoss and d < bestD)
+				if d <= range and better and (not needLos or losClear(origin, p, inst)) then
+					best, bestD, bestBoss = p, d, boss
 				end
 			end
 		end
 	end
 	return best
+end
+
+local function nearestVisibleEnemy(origin, range)
+	return pickBowTarget(origin, range, true)
+end
+
+-- Velocity of the current bow target, sampled every frame. Rigged enemies are moved by
+-- CFrame server-side, so AssemblyLinearVelocity reads zero; measure it instead.
+local velTarget, velLastPos, velLastT, velEst = nil, nil, 0, Vector3.zero
+local function trackVelocity(part)
+	if part ~= velTarget then
+		velTarget, velLastPos, velLastT, velEst = part, part and part.Position, os.clock(), Vector3.zero
+	end
+end
+track(RunService.Heartbeat:Connect(function()
+	local p = velTarget
+	if not (p and p.Parent) then return end
+	local now = os.clock()
+	local dt = now - velLastT
+	if dt < 1 / 30 then return end
+	local v = (p.Position - velLastPos) / dt
+	if v.Magnitude > 60 then v = Vector3.zero end -- teleport / respawn, not movement
+	velEst = velEst:Lerp(v, 0.35)
+	velLastPos, velLastT = p.Position, now
+end))
+
+-- where to aim so a moving target walks into the arrow
+local function leadPosition(origin, part, proj, draw)
+	local pos = part.Position
+	if part ~= velTarget or velEst.Magnitude < 0.5 then return pos end
+	local speed = 150
+	if WCFG and proj then
+		local ok, s = pcall(WCFG.launchSpeed, proj, draw)
+		if ok and type(s) == "number" and s > 0 then speed = s end
+	end
+	local flat = Vector3.new(velEst.X, 0, velEst.Z) -- ground mobs: ignore bobbing
+	local aim = pos
+	for _ = 1, 2 do
+		local t = (aim - origin).Magnitude / speed + 0.05 -- + server tick
+		aim = pos + flat * t
+	end
+	return aim
 end
 
 local bowBusy = false -- true while the bow has a target, so melee does not steal the equip
@@ -402,25 +500,21 @@ local function bowLoop()
 		local target
 		if hrp and State.Magic then
 			if State.Blink then
-				-- stick to one slime until it dies, goes dormant, or turns out immune
-				if lockedTarget and targetAlive(lockedTarget) and not isImmune(lockedTarget) then
-					target = lockedTarget
-				else
-					-- blink ignores walls: we fire from right under the target
-					local bestD = Values.BlinkRange
-					for _, inst in ipairs(enemies) do
-						local p = targetAlive(inst) and hitPart(inst)
-						if p and not isImmune(p) then
-							local d = (p.Position - hrp.Position).Magnitude
-							if d < bestD then target, bestD = p, d end
-						end
-					end
-					lockedTarget = target
-				end
+				-- stick to one target until it dies, goes dormant, gets switched off or a boss shows up
+				-- (blink ignores walls: we fire from right next to the target)
+				local best = pickBowTarget(hrp.Position, Values.BlinkRange, false)
+				local lockInst = lockedTarget and enemyOf(lockedTarget)
+				local keep = lockInst and lockedTarget.Parent and targetAlive(lockInst)
+					and shootable(lockInst) and not isImmune(lockedTarget)
+					and not (best and best ~= lockedTarget and isBossType(enemyKind(enemyOf(best)))
+						and not isBossType(enemyKind(lockInst)))
+				target = keep and lockedTarget or best
+				lockedTarget = target
 			else
-				target = nearestVisibleEnemy(shotOrigin(hrp), 300)
+				target = nearestVisibleEnemy(shotOrigin(hrp), Values.BowRange)
 			end
 		end
+		trackVelocity(target)
 		bowBusy = target ~= nil
 		if hrp and (target or not State.Magic) then
 			-- only re-equip when the bow isn't already out: re-equipping restarts the draw timer
@@ -463,13 +557,17 @@ local function bowLoop()
 						origin = target.Position + Vector3.new(0, 0.5, BLINK_SIDE)
 						local off = origin - bow
 						if off.Magnitude > SHOT_SLACK then origin = bow + off.Unit * SHOT_SLACK end
+						aimPos = target.Position
 					else
-						-- spawn the arrow as close to the target as the slack allows
-						local rel = target.Position - origin
+						-- spawn the arrow as close to the (led) target as the slack allows
+						aimPos = leadPosition(origin, target, proj, draw)
+						local rel = aimPos - origin
 						local push = math.min(rel.Magnitude - 1.5, SHOT_SLACK)
-						if push > 0 then origin += rel.Unit * push end
+						if push > 0 then
+							origin += rel.Unit * push
+							aimPos = leadPosition(origin, target, proj, draw)
+						end
 					end
-					aimPos = target.Position
 				end
 				local dir = aimPos and aimAt(origin, aimPos, proj, draw)
 					or (workspace.CurrentCamera and workspace.CurrentCamera.CFrame.LookVector)
@@ -484,7 +582,7 @@ local function bowLoop()
 					local char = getChar()
 					if char then setNoclip(char, false, collide) end
 				end
-				if target then
+				if target and immunityApplies(enemyOf(target)) then
 					local before = healthOf(target)
 					task.delay(0.6, function()
 						if not target.Parent then noDamage[target] = nil return end
@@ -995,7 +1093,7 @@ local function slider(label, key, minV, maxV, suffix)
 	render()
 end
 
-local function typeChips()
+local function chips(tbl, names, onToggle)
 	local holder = Instance.new("Frame")
 	holder.Size = UDim2.new(1, 0, 0, 0)
 	holder.AutomaticSize = Enum.AutomaticSize.Y
@@ -1007,13 +1105,10 @@ local function typeChips()
 	grid.CellPadding = UDim2.fromOffset(4, 4)
 	grid.SortOrder = Enum.SortOrder.Name
 	grid.Parent = holder
-	local names = {}
-	for nt in pairs(FarmTypes) do names[#names + 1] = nt end
-	table.sort(names)
-	for _, nt in ipairs(names) do
+	for i, nt in ipairs(names) do
 		local b = Instance.new("TextButton")
-		b.Name = nt
-		b.Text = nt
+		b.Name = string.format("%02d", i)
+		b.Text = (nt:gsub("Skeleton(%u)", "Skel %1"):gsub("Slime$", ""))
 		b.Font = Enum.Font.GothamMedium
 		b.TextSize = 11
 		b.AutoButtonColor = true
@@ -1021,13 +1116,14 @@ local function typeChips()
 		b.Parent = holder
 		corner(b, 4)
 		local function paint()
-			b.BackgroundColor3 = FarmTypes[nt] and C.on or C.off
-			b.TextColor3 = FarmTypes[nt] and C.bg or C.dim
+			local on = tbl[nt] ~= false
+			b.BackgroundColor3 = on and C.on or C.off
+			b.TextColor3 = on and C.bg or C.dim
 		end
 		paint()
 		track(b.MouseButton1Click:Connect(function()
-			FarmTypes[nt] = not FarmTypes[nt]
-			if farmTarget and farmTarget:GetAttribute("NodeType") == nt then farmTarget = nil end
+			tbl[nt] = tbl[nt] == false
+			if onToggle then onToggle(nt, tbl[nt]) end
 			paint(); saveConfig()
 		end))
 	end
@@ -1036,7 +1132,14 @@ end
 section("Farm")
 featureRow("Farm",   "Auto Farm")
 featureRow("Travel", "Farm Travel")
-typeChips()
+do
+	local names = {}
+	for nt in pairs(FarmTypes) do names[#names + 1] = nt end
+	table.sort(names)
+	chips(FarmTypes, names, function(nt)
+		if farmTarget and farmTarget:GetAttribute("NodeType") == nt then farmTarget = nil end
+	end)
+end
 slider("Reach", "Reach", 4, 16, " studs")
 slider("Swing early (0.01s, server slack 0.15)", "SwingEarly", 0, 14, "")
 slider("Travel speed", "TravelSpeed", 15, 80, " st/s")
@@ -1047,6 +1150,25 @@ featureRow("Fight", "Auto Fight")
 featureRow("Bow",   "Auto Bow")
 featureRow("Magic", "Magic Aim")
 featureRow("Blink", "Blink Shot")
+do
+	-- mobs ordered weakest to strongest, bosses on their own row
+	local hpOf = function(id)
+		local e = ECFG and ECFG.Enemies and ECFG.Enemies[id]
+		return (type(e) == "table" and e.hp) or 0
+	end
+	local mobs, bosses = {}, {}
+	for id in pairs(ShootTypes) do
+		if isBossType(id) then bosses[#bosses + 1] = id else mobs[#mobs + 1] = id end
+	end
+	local byHp = function(a, b) if hpOf(a) ~= hpOf(b) then return hpOf(a) < hpOf(b) end return a < b end
+	table.sort(mobs, byHp); table.sort(bosses, byHp)
+	local unlock = function() lockedTarget = nil end
+	section("Bow targets: mobs")
+	chips(ShootTypes, mobs, unlock)
+	section("Bow targets: bosses (shot first)")
+	chips(ShootTypes, bosses, unlock)
+end
+slider("Bow range", "BowRange", 50, 500, " studs")
 slider("Blink range", "BlinkRange", 20, 300, " studs")
 slider("Blink depth (0 = above ground)", "BlinkDepth", 0, 15, " studs")
 slider("Bow draw (low = fast, high = damage)", "Draw", 12, 100, "%")
@@ -1123,10 +1245,11 @@ end))
 -- Unload
 --------------------------------------------------------------------
 env.AboveAutohit = {
-	State = State, Values = Values, Binds = Binds, FarmTypes = FarmTypes, Set = setFeature,
+	State = State, Values = Values, Binds = Binds, FarmTypes = FarmTypes, ShootTypes = ShootTypes, Set = setFeature,
 	Debug = function()
 		return { slot = curSlot, items = slotItem, cooldowns = slotCooldown, target = farmTarget,
-			nodes = #nodes, enemies = #enemies, traveling = traveling }
+			nodes = #nodes, enemies = #enemies, traveling = traveling,
+			bowTarget = velTarget, bowVel = velEst }
 	end,
 	Unload = function()
 		alive = false
