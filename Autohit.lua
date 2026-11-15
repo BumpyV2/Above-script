@@ -180,6 +180,41 @@ local function aimAt(origin, target, proj, draw)
 	return rel.Unit
 end
 
+local SHOT_SLACK = ((WCFG and WCFG.ShotOriginSlackStuds) or 12) - 0.5
+
+local function shotOrigin(hrp)
+	local c = getChar()
+	local ht = c and c:FindFirstChild("HeldTool")
+	local att = ht and ht:FindFirstChild((WCFG and WCFG.ShotOriginAttachment) or "ShotOrigin", true)
+	if att and att:IsA("Attachment") then return att.WorldPosition end
+	return hrp.Position
+end
+
+-- nearest enemy the arrow can actually reach: a blocked line just buries the arrow in a ledge
+local losParams = RaycastParams.new()
+losParams.FilterType = Enum.RaycastFilterType.Exclude
+local function nearestVisibleEnemy(origin, range)
+	local c = getChar()
+	losParams.FilterDescendantsInstances = c and { c } or {}
+	local best, bestD = nil, range
+	for _, inst in ipairs(enemies) do
+		if targetAlive(inst) then
+			local p = hitPart(inst)
+			if p then
+				local rel = p.Position - origin
+				local d = rel.Magnitude
+				if d < bestD then
+					local hit = workspace:Raycast(origin, rel, losParams)
+					if not hit or hit.Instance == p or hit.Instance:IsDescendantOf(inst) then
+						best, bestD = p, d
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
 local bowBusy = false -- true while the bow has a target, so melee does not steal the equip
 local function setAim(on)
 	if RequestSprint then pcall(function() RequestSprint:FireServer(on, "Aim") end) end
@@ -196,15 +231,26 @@ local function bowLoop()
 		local draw = math.clamp(Values.Draw / 100, 0.12, 1)
 		local target
 		if hrp and State.Magic then
-			local _, part = nearestIn(enemies, hrp.Position, 300)
-			target = part
+			target = nearestVisibleEnemy(shotOrigin(hrp), 300)
 		end
 		bowBusy = target ~= nil
 		if hrp and (target or not State.Magic) then
-			equip("Weapon")
+			-- only re-equip when the bow isn't already out: re-equipping restarts the draw timer
+			if not heldProjectile() then
+				equipped = nil
+				equip("Weapon")
+				task.wait(0.4)
+			end
 			local proj = heldProjectile()
 			if proj then
-				local origin = hrp.Position
+				local origin = shotOrigin(hrp)
+				if target then
+					-- server accepts a launch point up to ShotOriginSlackStuds (12) from the bow:
+					-- spawn the arrow as close to the target as that allows
+					local rel = target.Position - origin
+					local push = math.min(rel.Magnitude - 1.5, SHOT_SLACK)
+					if push > 0 then origin += rel.Unit * push end
+				end
 				local dir = target and aimAt(origin, target.Position, proj, draw)
 					or (workspace.CurrentCamera and workspace.CurrentCamera.CFrame.LookVector)
 				if dir then
