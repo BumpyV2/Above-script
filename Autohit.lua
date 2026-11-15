@@ -6,7 +6,7 @@
   Unload: getgenv().AboveAutohit.Unload()
 ]]
 
-local VERSION = "3.2"
+local VERSION = "3.3"
 
 local Players    = game:GetService("Players")
 local RS         = game:GetService("ReplicatedStorage")
@@ -468,7 +468,34 @@ local function leadPosition(origin, part, proj, draw)
 	return aim
 end
 
-local bowBusy = false -- true while the bow has a target, so melee does not steal the equip
+local bowBusy = false -- true while the bow holds the tool, so melee and travel wait
+local traveling = false -- Farm Travel is mid-trip (set in travelTo below)
+
+-- Shared tool lock between Bow and Farm. Without it they re-equip over each other
+-- every bow cycle and Farm loses about half its swings.
+--   * Farm owns the tool while a node is in reach or a trip is running.
+--   * Between nodes the bow gets a short turn (BOW_TURN shots), then Travel moves on.
+--   * Bosses take the tool straight away, except mid-trip.
+local BOW_TURN = 2
+local bowTurnShots = 0
+
+local function farmHasNode(hrp)
+	return nearestIn(nodes, hrp.Position, Values.Reach, nodeEligible) ~= nil
+end
+
+local function bowShouldYield(hrp, target)
+	if not (hrp and (State.Farm or State.Travel)) then return false end
+	if traveling then return true end
+	if target and isBossType(enemyKind(enemyOf(target))) then return false end
+	if farmHasNode(hrp) then
+		bowTurnShots = 0
+		return true
+	end
+	-- turn is used up and Travel has somewhere to go: let it fly
+	return State.Travel and bowTurnShots >= BOW_TURN
+		and nearestIn(nodes, hrp.Position, Values.TravelRange, nodeEligible) ~= nil
+end
+
 local function setAim(on)
 	if RequestSprint then pcall(function() RequestSprint:FireServer(on, "Aim") end) end
 end
@@ -515,9 +542,11 @@ local function bowLoop()
 				target = nearestVisibleEnemy(shotOrigin(hrp), Values.BowRange)
 			end
 		end
+		local yield = bowShouldYield(hrp, target)
+		if yield then target = nil end
 		trackVelocity(target)
 		bowBusy = target ~= nil
-		if hrp and (target or not State.Magic) then
+		if hrp and not yield and (target or not State.Magic) then
 			-- only re-equip when the bow isn't already out: re-equipping restarts the draw timer
 			if not heldProjectile() then
 				pendingEquip = nil
@@ -574,6 +603,7 @@ local function bowLoop()
 					or (workspace.CurrentCamera and workspace.CurrentCamera.CFrame.LookVector)
 				if dir then
 					shotId += 1
+					bowTurnShots += 1
 					RequestShoot:FireServer(origin, dir, draw, shotId)
 				end
 				if home then
@@ -618,7 +648,6 @@ end
 --------------------------------------------------------------------
 local lastSwing = 0
 local farmTarget -- sticky: finish one node before starting the next (nodes heal when left alone)
-local traveling = false
 
 local function swingReady(slot)
 	return os.clock() - lastSwing >= swingInterval(slot)
