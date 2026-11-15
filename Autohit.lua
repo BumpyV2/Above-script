@@ -38,7 +38,7 @@ pcall(function() WCFG = require(RS.Shared.Config.WeaponConfig) end)
 local CONFIG_FILE = "AboveHub.json"
 
 local State = {
-	Farm = false, Fight = false, Bow = false, Magic = true,
+	Farm = false, Fight = false, Bow = false, Magic = true, Blink = false,
 	Speed = false, Jump = false, Fly = false,
 }
 
@@ -48,10 +48,11 @@ local Values = {
 	FlySpeed = 60,    -- studs/s
 	Draw     = 12,    -- bow draw %, 12 = max fire rate, 100 = max damage
 	Reach    = 12,    -- melee reach in studs
+	BlinkRange = 150, -- how far Blink Shot will hop for a target
 }
 
 local Binds = {
-	Menu = "RightShift", Farm = "H", Fight = "J", Bow = "B", Magic = "N",
+	Menu = "RightShift", Farm = "H", Fight = "J", Bow = "B", Magic = "N", Blink = "V",
 	Speed = "U", Jump = "K", Fly = "F",
 }
 
@@ -231,7 +232,13 @@ local function bowLoop()
 		local draw = math.clamp(Values.Draw / 100, 0.12, 1)
 		local target
 		if hrp and State.Magic then
-			target = nearestVisibleEnemy(shotOrigin(hrp), 300)
+			if State.Blink then
+				-- blink ignores walls: we fire from right above the target
+				local _, part = nearestIn(enemies, hrp.Position, Values.BlinkRange)
+				target = part
+			else
+				target = nearestVisibleEnemy(shotOrigin(hrp), 300)
+			end
 		end
 		bowBusy = target ~= nil
 		if hrp and (target or not State.Magic) then
@@ -243,6 +250,14 @@ local function bowLoop()
 			end
 			local proj = heldProjectile()
 			if proj then
+				-- Blink: hop next to the target so the server sees us there, shoot, hop back
+				local home
+				if target and State.Blink then
+					home = hrp.CFrame
+					hrp.CFrame = CFrame.new(target.Position + Vector3.new(0, 6, 6), target.Position)
+					for _ = 1, 3 do RunService.Heartbeat:Wait() end
+					task.wait(0.12) -- let the position replicate before the shot arrives
+				end
 				local origin = shotOrigin(hrp)
 				local aimPos
 				if target then
@@ -258,6 +273,11 @@ local function bowLoop()
 				if dir then
 					shotId += 1
 					RequestShoot:FireServer(origin, dir, draw, shotId)
+				end
+				if home then
+					task.wait(0.15)
+					local r = getHRP()
+					if r then r.CFrame = home; r.AssemblyLinearVelocity = Vector3.zero end
 				end
 				-- server gates on cooldown AND draw time; firing faster is discarded
 				local wait = math.max(proj.cooldownSeconds or 0.25, draw * (proj.drawSeconds or 1)) + 0.03
@@ -646,6 +666,8 @@ featureRow("Fight", "Auto Fight")
 slider("Reach", "Reach", 4, 20, " studs")
 featureRow("Bow",   "Auto Bow")
 featureRow("Magic", "Magic Aim")
+featureRow("Blink", "Blink Shot")
+slider("Blink range", "BlinkRange", 20, 300, " studs")
 slider("Bow draw (low = fast, high = damage)", "Draw", 12, 100, "%")
 
 section("Movement")
