@@ -1035,7 +1035,7 @@ end
 
 section("Farm")
 featureRow("Farm",   "Auto Farm")
-featureRow("Travel", "Farm Travel (go to nodes)")
+featureRow("Travel", "Farm Travel")
 typeChips()
 slider("Reach", "Reach", 4, 16, " studs")
 slider("Swing early (0.01s, server slack 0.15)", "SwingEarly", 0, 14, "")
